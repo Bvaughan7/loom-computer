@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/loom-computer-logo.webp" width="160" alt="Loom Computer">
+</p>
+
 <h1 align="center">Loom Computer</h1>
 
 <p align="center">
