@@ -1,0 +1,126 @@
+name: release
+
+# A version tag (vX.Y.Z) builds the image, pushes it to GHCR as
+# ghcr.io/bvaughan7/loom-computer:<version>, and creates the GitHub release
+# Loom's desk discovers. workflow_dispatch is a dry run: it builds, smoke-checks
+# the guide and pushes nothing.
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+"]
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Tag for the dry-run build (nothing is pushed)"
+        required: true
+        default: "dryrun"
+
+permissions:
+  contents: read
+
+env:
+  IMAGE: ghcr.io/bvaughan7/loom-computer
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # create the GitHub release
+      packages: write   # push to GHCR
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: v
+        env:
+          EVENT: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_TAG: ${{ inputs.image_tag }}
+        run: |
+          set -euo pipefail
+          file_version="$(tr -d '[:space:]' < VERSION)"
+          echo "file=$file_version" >> "$GITHUB_OUTPUT"
+          if [ "$EVENT" = push ]; then
+            tag_version="${REF_NAME#v}"
+            if [ "$tag_version" != "$file_version" ]; then
+              echo "::error::tag $REF_NAME does not match VERSION file ($file_version)"
+              exit 1
+            fi
+            echo "tag=$tag_version" >> "$GITHUB_OUTPUT"
+          else
+            if ! printf '%s' "$INPUT_TAG" | grep -Eq '^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$'; then
+              echo "::error::invalid image_tag"
+              exit 1
+            fi
+            echo "tag=$INPUT_TAG" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build (loaded locally for the smoke check)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          push: false
+          tags: ${{ env.IMAGE }}:${{ steps.v.outputs.tag }}
+          build-args: VERSION=${{ steps.v.outputs.file }}
+
+      - name: Smoke check - the image serves the VERSION it was built from
+        env:
+          REF: ${{ env.IMAGE }}:${{ steps.v.outputs.tag }}
+          WANT: ${{ steps.v.outputs.file }}
+        run: |
+          set -euo pipefail
+          cid="$(docker run -d -e LOOM_COMPUTER_TOKEN=ci-smoke -p 127.0.0.1:8787:8787 "$REF")"
+          trap 'docker rm -f "$cid" >/dev/null' EXIT
+          for _ in $(seq 60); do
+            curl -fsS http://127.0.0.1:8787/health >/dev/null 2>&1 && break
+            sleep 1
+          done
+          got="$(curl -fsS -X POST http://127.0.0.1:8787/mcp \
+            -H 'Authorization: Bearer ci-smoke' -H 'Content-Type: application/json' \
+            -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"state","arguments":{"action":"guide"}}}' \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["result"]["structuredContent"]["version"])')"
+          if [ "$got" != "$WANT" ]; then
+            echo "::error::guide serves '$got', VERSION file says '$WANT'"
+            exit 1
+          fi
+
+      - name: Log in to GHCR
+        if: github.event_name == 'push'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push
+        if: github.event_name == 'push'
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ env.IMAGE }}:${{ steps.v.outputs.tag }}
+          build-args: VERSION=${{ steps.v.outputs.file }}
+
+      - name: Create GitHub release
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+          REF: ${{ env.IMAGE }}:${{ steps.v.outputs.tag }}
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          set -euo pipefail
+          test -n "$DIGEST"
+          {
+            echo "Loom Computer image **${TAG#v}**."
+            echo
+            echo "- Image: \`$REF\`"
+            echo "- Digest: \`$DIGEST\`"
+            echo "- Pinned: \`${REF%:*}@$DIGEST\`"
+            echo
+            echo "Private package: \`docker login ghcr.io\` with a PAT that has \`read:packages\`."
+          } > notes.md
+          gh release create "$TAG" --verify-tag --title "$TAG" --notes-file notes.md
