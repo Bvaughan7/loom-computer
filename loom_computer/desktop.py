@@ -51,6 +51,10 @@ class Desktop:
         self._pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="x11")
         self._grabber = None
         self._xdisplay = None
+        # X input state is shared by every viewer: how many sessions hold each
+        # keycode / button, so one closing cannot release another's input.
+        self._held_keys: dict[int, int] = {}
+        self._held_buttons: dict[int, int] = {}
 
     # -- worker-thread side ------------------------------------------------
 
@@ -116,18 +120,34 @@ class Desktop:
     async def key_down(self, keysym: int) -> int | None:
         code = await self._run(self._keycode, keysym)
         if code:
+            self._held_keys[code] = self._held_keys.get(code, 0) + 1
             await self._run(self._fake, "key_down", code)
             return code
         return None
 
     async def key_up(self, keycode: int) -> None:
-        await self._run(self._fake, "key_up", keycode)
+        if _release(self._held_keys, keycode):
+            await self._run(self._fake, "key_up", keycode)
 
     async def button(self, number: int, down: bool) -> None:
+        if down:
+            self._held_buttons[number] = self._held_buttons.get(number, 0) + 1
+        elif not _release(self._held_buttons, number):
+            return
         await self._run(self._fake, "btn_down" if down else "btn_up", number)
 
     async def move(self, x: int, y: int) -> None:
         await self._run(self._fake, "motion", 0, x, y)
+
+
+def _release(held: dict[int, int], item: int) -> bool:
+    """Drop one hold on `item`; True when nobody holds it any more."""
+    count = held.get(item, 0) - 1
+    if count > 0:
+        held[item] = count
+        return False
+    held.pop(item, None)
+    return True
 
 
 def _encode(width: int, height: int, bgra: bytes) -> bytes:
