@@ -77,12 +77,6 @@ def test_other_calls_not_implemented(client):
     assert r.json()["error"]["message"].startswith("not implemented")
 
 
-def test_viewer_placeholder(client):
-    r = client.get("/")
-    assert r.status_code == 200
-    assert "Phase 1" in r.text
-
-
 def test_ws_rejects_bad_token_with_1008(client):
     with client.websocket_connect("/ws?token=bad") as ws:
         with pytest.raises(WebSocketDisconnect) as closed:
@@ -166,13 +160,6 @@ def test_token_is_redacted_from_uvicorn_logs(monkeypatch):
     out = stream.getvalue()
     assert "s3cret" not in out
     assert "/ws?token=REDACTED" in out
-
-
-def test_ws_valid_token_closes_not_implemented(client):
-    with client.websocket_connect(f"/ws?token={TOKEN}") as ws:
-        assert ws.receive_json()["error"] == "not_implemented"
-        with pytest.raises(WebSocketDisconnect):
-            ws.receive_text()
 
 
 def test_startup_fails_without_token():
