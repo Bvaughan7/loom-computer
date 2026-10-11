@@ -5,6 +5,12 @@
 </p>
 
 <p align="center">
+  <a href="LICENSE-APACHE"><img src="https://img.shields.io/badge/License-Apache_2.0-blue.svg" alt="Apache-2.0"></a>
+  <img src="https://img.shields.io/badge/docker-ghcr.io-2496ED?logo=docker&logoColor=white" alt="GHCR">
+  <img src="https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white" alt="Python 3.12">
+</p>
+
+<p align="center">
   <a href="#-quick-start">Quick Start</a> ·
   <a href="#-features">Features</a> ·
   <a href="#-architecture">Architecture</a> ·
@@ -104,3 +110,7 @@ python -m pytest
 
 Issues and pull requests are welcome. If the code and `docs/contract.md`
 disagree, the code wins and the doc gets fixed in the same change.
+
+## License
+
+Licensed under the Apache License 2.0 or the MIT license, at your option -- same as [Loom](https://github.com/Bvaughan7/loom).
