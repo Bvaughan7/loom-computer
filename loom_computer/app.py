@@ -1,10 +1,12 @@
 """HTTP surface of the computer: /health, /mcp, /, /ws."""
 
+import copy
 import hashlib
 import hmac
 import json
 import logging
 import os
+import re
 import sys
 from importlib import resources
 
@@ -33,13 +35,17 @@ def _skill_document() -> str:
 
 
 def guide() -> dict:
-    """The release's own skill with its version and checksum."""
+    """The release's own skill with its version and checksum.
+
+    The shape is the manifest Loom's guide parser reads: `version`, a bare
+    hex `sha256` of the `skill` text.
+    """
     document = _skill_document()
     return {
         "name": SKILL_NAME,
         "version": VERSION,
-        "checksum": "sha256:" + hashlib.sha256(document.encode("utf-8")).hexdigest(),
-        "content": document,
+        "sha256": hashlib.sha256(document.encode("utf-8")).hexdigest(),
+        "skill": document,
     }
 
 
@@ -51,8 +57,15 @@ def _rpc_error(rpc_id, code: int, message: str) -> dict:
     return {"jsonrpc": "2.0", "id": rpc_id, "error": {"code": code, "message": message}}
 
 
-def _not_implemented(rpc_id, what: str) -> dict:
-    return _rpc_error(rpc_id, -32601, f"not implemented: {what}")
+INVALID_REQUEST = -32600
+
+
+def _not_implemented(rpc_id) -> dict:
+    return _rpc_error(rpc_id, -32601, "not implemented")
+
+
+def _invalid(rpc_id, why: str) -> dict:
+    return _rpc_error(rpc_id, INVALID_REQUEST, f"invalid request: {why}")
 
 
 STATE_TOOL = {
@@ -67,34 +80,49 @@ STATE_TOOL = {
 
 
 def _handle_rpc(message: dict) -> dict | None:
+    """Answer one JSON-RPC message; None for a notification (no `id` member)."""
+    has_id = "id" in message
     rpc_id = message.get("id")
+    if isinstance(rpc_id, bool) or not isinstance(rpc_id, (str, int, type(None))):
+        return _invalid(None, "id must be a string, number or null")
+    if message.get("jsonrpc") != "2.0":
+        return _invalid(rpc_id, 'jsonrpc must be "2.0"')
     method = message.get("method")
-    params = message.get("params") or {}
-
-    if method is None:
-        return _rpc_error(rpc_id, -32600, "invalid request: method required")
-    if rpc_id is None:  # notification: no response
+    if not isinstance(method, str):
+        return _invalid(rpc_id, "method must be a string")
+    params = message.get("params")
+    if params is None:
+        params = {}
+    if not isinstance(params, dict):
+        return _invalid(rpc_id, "params must be an object")
+    if not has_id:  # notification: no response
         return None
+
     if method == "initialize":
+        version = params.get("protocolVersion", "2025-03-26")
+        if not isinstance(version, str):
+            return _invalid(rpc_id, "protocolVersion must be a string")
         return _rpc_result(rpc_id, {
-            "protocolVersion": params.get("protocolVersion", "2025-03-26"),
+            "protocolVersion": version,
             "capabilities": {"tools": {}},
             "serverInfo": {"name": SKILL_NAME, "version": VERSION},
         })
     if method == "tools/list":
         return _rpc_result(rpc_id, {"tools": [STATE_TOOL]})
     if method == "tools/call":
-        tool = params.get("name")
-        args = params.get("arguments") or {}
-        if tool == "state" and args.get("action") == "guide":
+        args = params.get("arguments")
+        if args is None:
+            args = {}
+        if not isinstance(args, dict):
+            return _invalid(rpc_id, "arguments must be an object")
+        if params.get("name") == "state" and args.get("action") == "guide":
             body = guide()
             return _rpc_result(rpc_id, {
                 "content": [{"type": "text", "text": json.dumps(body)}],
                 "structuredContent": body,
                 "isError": False,
             })
-        return _not_implemented(rpc_id, f"tool {tool!r} action {args.get('action')!r}")
-    return _not_implemented(rpc_id, f"method {method!r}")
+    return _not_implemented(rpc_id)
 
 
 def create_app(token: str) -> FastAPI:
@@ -107,20 +135,30 @@ def create_app(token: str) -> FastAPI:
         return candidate is not None and hmac.compare_digest(
             candidate.encode("utf-8"), token.encode("utf-8"))
 
+    def bearer_ok(request: Request) -> bool:
+        scheme, _, presented = request.headers.get("authorization", "").partition(" ")
+        return scheme.lower() == "bearer" and token_ok(presented.strip())
+
+    @app.middleware("http")
+    async def require_bearer(request: Request, call_next):
+        # The contract leaves only the liveness probe and the viewer page
+        # (whose token rides in the URL fragment) open; every other route and
+        # method, known or not, answers the JSON 401 before routing.
+        open_route = request.method in ("GET", "HEAD") and request.url.path in ("/health", "/")
+        if not open_route and not bearer_ok(request):
+            return JSONResponse(
+                {"error": "unauthorized", "message": "valid bearer token required"},
+                status_code=401,
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        return await call_next(request)
+
     @app.get("/health")
     async def health():
         return {"status": "ok", "version": VERSION}
 
     @app.post("/mcp")
     async def mcp(request: Request):
-        header = request.headers.get("authorization", "")
-        scheme, _, presented = header.partition(" ")
-        if scheme.lower() != "bearer" or not token_ok(presented.strip()):
-            return JSONResponse(
-                {"error": "unauthorized", "message": "valid bearer token required"},
-                status_code=401,
-                headers={"WWW-Authenticate": "Bearer"},
-            )
         # Phase 0: the holder is recognized and logged, nothing more.
         log.debug("mcp request holder=%s", request.headers.get("x-computer-holder"))
         try:
@@ -134,7 +172,8 @@ def create_app(token: str) -> FastAPI:
         response = _handle_rpc(message)
         if response is None:
             return JSONResponse(None, status_code=202)
-        return JSONResponse(response)
+        invalid = response.get("error", {}).get("code") == INVALID_REQUEST
+        return JSONResponse(response, status_code=400 if invalid else 200)
 
     @app.get("/", response_class=HTMLResponse)
     async def viewer():
@@ -142,15 +181,44 @@ def create_app(token: str) -> FastAPI:
 
     @app.websocket("/ws")
     async def ws(websocket: WebSocket):
+        # Accept first: closing before accept is an HTTP 403 handshake
+        # rejection and the peer never sees a close code.
+        await websocket.accept()
         if not token_ok(websocket.query_params.get("token")):
             await websocket.close(code=1008, reason="unauthorized")
             return
-        await websocket.accept()
         await websocket.send_text(json.dumps(
             {"error": "not_implemented", "message": "the viewer socket lands in Phase 1"}))
         await websocket.close(code=1013, reason="not implemented")
 
     return app
+
+
+_TOKEN_QUERY = re.compile(r"([?&]token=)[^&\s\"']*")
+
+
+class _RedactToken(logging.Filter):
+    """Keeps `?token=` values out of every record uvicorn emits.
+
+    Uvicorn logs the websocket request target, query string included, at INFO.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = record.getMessage()
+        if "token=" in message:
+            record.msg, record.args = _TOKEN_QUERY.sub(r"\1REDACTED", message), ()
+        return True
+
+
+def log_config() -> dict:
+    """Uvicorn's logging config with token redaction on every handler."""
+    from uvicorn.config import LOGGING_CONFIG
+
+    config = copy.deepcopy(LOGGING_CONFIG)
+    config["filters"] = {"redact_token": {"()": _RedactToken}}
+    for handler in config["handlers"].values():
+        handler["filters"] = ["redact_token"]
+    return config
 
 
 def main() -> None:
@@ -161,4 +229,5 @@ def main() -> None:
     if not token:
         sys.exit("loom-computer: LOOM_COMPUTER_TOKEN is not set; refusing to start "
                  "(every /mcp call needs a bearer token)")
-    uvicorn.run(create_app(token), host="0.0.0.0", port=PORT, log_level="info")
+    uvicorn.run(create_app(token), host="0.0.0.0", port=PORT, log_level="info",
+                access_log=False, log_config=log_config())

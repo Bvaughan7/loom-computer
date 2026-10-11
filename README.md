@@ -15,10 +15,12 @@ Source of truth: Loom's `docs/computer.md`. Phase 0 implements:
 | Route | Behavior |
 | --- | --- |
 | `GET /health` | Open liveness probe, `200 {"status":"ok","version":"0.10.3"}`. |
-| `POST /mcp` | Needs `Authorization: Bearer $LOOM_COMPUTER_TOKEN`, else JSON 401. JSON-RPC body. `tools/call` `state` with `action: "guide"` returns the release skill (`name`, `version`, `checksum`, `content`); everything else is a JSON-RPC "not implemented" error. `initialize` and `tools/list` are answered minimally. |
+| `POST /mcp` | Needs `Authorization: Bearer $LOOM_COMPUTER_TOKEN`, else JSON 401 for every method (as does every route other than `GET /health` and `GET /`). JSON-RPC body. `tools/call` `state` with `action: "guide"` returns the release skill (`name`, `version`, bare-hex `sha256` of `skill`, and the `skill` text); everything else is a JSON-RPC "not implemented" error. `initialize` and `tools/list` are answered minimally. |
 | `X-Computer-Holder` | Names the teammate for leases and queued runs. Phase 0 only logs it at debug level. |
 | `GET /` | Viewer placeholder page (the real viewer lands in Phase 1). |
-| `GET /ws` | Needs `?token=` matching the bearer; then sends a not-implemented message and closes (code 1013). Bad token closes with 1008. |
+| `GET /ws` | Needs `?token=` matching the bearer; then sends a not-implemented message and closes (code 1013). Bad token is accepted and then closed with 1008, so the peer sees the code (closing before the handshake would be an HTTP 403). |
+
+Uvicorn access logging is off and `?token=` values are redacted from its remaining logs.
 
 Port 8787, bound to `0.0.0.0` inside the container (Loom publishes it on
 loopback). The server refuses to start if `LOOM_COMPUTER_TOKEN` is unset.
