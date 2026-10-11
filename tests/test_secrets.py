@@ -55,6 +55,10 @@ class FakeCDP:
         self.sockets: dict[int, object] = {}
         self.bindings: dict[int, list] = {}
         self.page_text = ""  # what `browser text` finds on every page
+        self.asks: list[dict] = []  # every create ask the page sent
+        self.guard_blocked: set[int] = set()  # tabs whose guard cannot install
+        self.guard_source: dict[int, str] = {}
+        self.settle_stray = None  # a credential added while an approval settles
         self._ready = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
 
@@ -96,6 +100,14 @@ class FakeCDP:
             method, params = msg["method"], msg.get("params", {})
             self.calls.append((index, method, params))
             result = self._answer(index, method, params)
+            if (self.settle_stray is not None and method == "Runtime.evaluate"
+                    and params.get("expression") == "document.readyState"):
+                # a stray add whose event lands while the approval is settling
+                stray, self.settle_stray = self.settle_stray, None
+                self.credentials[index][stray["credentialId"]] = stray
+                await socket.send(json.dumps({
+                    "method": "WebAuthn.credentialAdded",
+                    "params": {"authenticatorId": f"auth{index}", "credential": stray}}))
             await socket.send(json.dumps({"id": msg["id"], "result": result}))
 
     def _answer(self, index, method, params):
@@ -128,6 +140,9 @@ class FakeCDP:
                 else:
                     self.fills.append(expression)
                     value = {"filled": "input"}
+            elif expression.startswith("((binding, nonce)"):
+                self.guard_source[index] = expression
+                value = index not in self.guard_blocked  # the guard's own verdict
             elif expression.startswith("window.__loomParked &&"):
                 # the page guard's own pending map: only real creates are in it
                 ident, nonce, _tab = json.loads("[" + expression.split("window.__loomParked(")[1]
@@ -154,9 +169,18 @@ class FakeCDP:
         """A create() the page guard parks: it holds a nonce for it."""
         ident, nonce = os.urandom(16).hex(), os.urandom(16).hex()
         self.pending[ident] = nonce
+        payload = {"id": ident, "nonce": nonce, **ask}
+        self.asks.append(payload)
         self.event(index, "Runtime.bindingCalled", {
             "name": passkeys_module.BINDING, "executionContextId": 7,
-            "payload": json.dumps({"id": ident, "nonce": nonce, **ask})})
+            "payload": json.dumps(payload)})
+        return payload
+
+    def page_replays(self, index, payload):
+        """The same ask again, as a page that kept the payload would send it."""
+        self.event(index, "Runtime.bindingCalled", {
+            "name": passkeys_module.BINDING, "executionContextId": 7,
+            "payload": json.dumps(payload)})
 
     def page_forges_ask(self, index, **fields):
         """The page calls the binding itself: nothing is parked behind it."""
@@ -784,6 +808,7 @@ def _approve(client, fake, **ask):
     client.post("/passkeys/registration/answer", headers=AUTH,
                 content=json.dumps({"id": status(client)["ask"]["id"], "approved": True}))
     assert wait_for(lambda: status(client)["status"] == "approved")
+    assert wait_for(lambda: fake.release_modes() == ["allow"])  # the create is released
 
 
 OTHER_HANDLE = base64.b64encode(b"someone-else").decode()
@@ -813,6 +838,9 @@ def test_a_non_resident_mint_without_a_user_handle_is_the_approved_credential(ma
     fake, client = make(["https://example.com"])
     with client:
         _approve(client, fake, userName="alice")
+        # the ask the page sent had no userId: this rides the nonce path alone
+        assert fake.asks and all("userId" not in a for a in fake.asks)
+        assert all(len(a["nonce"]) == 32 for a in fake.asks)
         minted = fake.mint(0, ident=b"non-resident", handle=None)
         assert "userHandle" not in minted
         assert wait_for(lambda: status(client)["status"] == "registered")
@@ -853,14 +881,19 @@ CredentialsContainer.prototype.create = function (o) { calls.push(o); return Pro
 CredentialsContainer.prototype.get = function () { return Promise.resolve('get'); };
 global.window = global;
 global.CredentialsContainer = CredentialsContainer;
-window.__ask = (p) => asked.push(JSON.parse(p));
+window.__ask = (p) => { const m = JSON.parse(p); if (m.kind !== 'guard') asked.push(m); };
 guard('__ask', 'tab-secret');
 const container = new CredentialsContainer();
 let reads = 0;
 const options = {get publicKey() { reads += 1; return reads === 1 ? undefined : {rp: {id: 'example.com'}, user: {name: 'a'}}; }};
+let reads2 = 0;
+const valid = {get publicKey() { reads2 += 1; return {rp: {id: 'example.com'}, user: {name: 'a'}}; }};
+container.create(valid);  // parked: asks, and never reaches the native create
+const askedAfterValid = asked.length;
 container.create(options).then(() => {
   const nativeSaw = calls.map((c) => !!c.publicKey);
-  console.log(JSON.stringify({asked: asked.length, native: nativeSaw}));
+  console.log(JSON.stringify({asked: asked.length - askedAfterValid, askedValid: askedAfterValid,
+                              native: nativeSaw, reads, reads2}));
 });
 """
 
@@ -876,7 +909,76 @@ def test_stateful_publickey_getter_does_not_slip_past_the_guard():
     assert out.returncode == 0, out.stderr
     seen = json.loads(out.stdout)
     # the one read said "no publicKey": the native create got a copy without it
-    assert seen == {"asked": 0, "native": [False]}
+    # and each publicKey getter was read exactly once, parked or not
+    assert seen == {"asked": 0, "askedValid": 1, "native": [False], "reads": 1, "reads2": 1}
+
+
+def test_an_unverifiable_guard_denies_every_ask_and_parks_nothing(make):
+    fake, client = make(["https://example.com"])
+    fake.guard_blocked = {0}  # the page predefined / froze the property
+    with client:
+        arm(client)
+        assert wait_for(lambda: 0 in fake.sockets)
+        fake.page_calls_create(0, rpId="example.com", userName="alice")
+        assert wait_for(lambda: fake.release_modes() == ["deny"])
+        assert status(client)["status"] == "armed"
+        assert client.app.state.passkeys._parked == {}
+
+
+def test_a_fresh_document_guard_report_with_the_tab_secret_restores_the_tab(make):
+    fake, client = make(["https://example.com"])
+    fake.guard_blocked = {0}
+    with client:
+        arm(client)
+        assert wait_for(lambda: 0 in fake.guard_source)
+        secret = json.loads(fake.guard_source[0].rsplit(", ", 1)[1].rstrip(")"))
+        report = lambda **f: fake.event(0, "Runtime.bindingCalled", {  # noqa: E731
+            "name": passkeys_module.BINDING, "executionContextId": 7,
+            "payload": json.dumps({"kind": "guard", "ok": True, **f})})
+        report(secret="forged-by-the-page")  # no secret, no standing
+        fake.page_calls_create(0, rpId="example.com")
+        assert wait_for(lambda: fake.release_modes() == ["deny"])
+        report(secret=secret)  # the new document's guard says it is in place
+        fake.page_calls_create(0, rpId="example.com")
+        assert wait_for(lambda: status(client)["status"] == "asked")
+
+
+def test_a_stray_event_before_the_released_mint_does_not_become_the_passkey(make):
+    fake, client = make(["https://example.com"])
+    with client:
+        arm(client)
+        assert wait_for(lambda: 0 in fake.sockets)
+        fake.page_calls_create(0, rpId="example.com", userName="alice")
+        assert wait_for(lambda: status(client)["status"] == "asked")
+        stray = {"credentialId": base64.b64encode(b"retained-native-create").decode(),
+                 "rpId": "example.com", "isResidentCredential": False,
+                 "privateKey": KEY, "signCount": 0}
+        fake.settle_stray = stray  # lands while the approval is settling, same rpId
+        client.post("/passkeys/registration/answer", headers=AUTH,
+                    content=json.dumps({"id": status(client)["ask"]["id"], "approved": True}))
+        assert wait_for(lambda: fake.release_modes() == ["allow"])
+        assert stray["credentialId"] not in fake.credentials[0]  # gone before the release
+        assert status(client)["status"] == "approved"
+        minted = fake.mint(0, ident=b"the-approved-call")
+        assert wait_for(lambda: status(client)["status"] == "registered")
+        assert status(client)["passkey"]["credentialId"] == minted["credentialId"]
+        assert minted["credentialId"] in fake.credentials[0]
+
+
+def test_a_used_nonce_is_denied_even_across_rearming(make):
+    fake, client = make(["https://example.com"])
+    with client:
+        arm(client)
+        assert wait_for(lambda: 0 in fake.sockets)
+        payload = fake.page_calls_create(0, rpId="example.com")
+        assert wait_for(lambda: status(client)["status"] == "asked")
+        assert client.delete("/passkeys/registration", headers=AUTH).status_code == 200
+        assert wait_for(lambda: fake.release_modes() == ["deny"])
+        arm(client)
+        fake.page_replays(0, payload)  # the page still "holds" it in the fake
+        assert wait_for(lambda: fake.release_modes() == ["deny", "deny"])
+        assert status(client)["status"] == "armed"
+        assert client.app.state.passkeys._parked == {}
 
 
 def test_a_credential_after_the_approved_one_is_removed(make):
@@ -911,6 +1013,7 @@ def test_minted_key_is_redacted_from_tool_output(make, workspace):
         assert wait_for(lambda: status(client)["status"] == "asked")
         client.post("/passkeys/registration/answer", headers=AUTH,
                     content=json.dumps({"id": status(client)["ask"]["id"], "approved": True}))
+        assert wait_for(lambda: fake.release_modes() == ["allow"])
         fake.mint(0)
         assert wait_for(lambda: status(client)["status"] == "registered")
         (workspace / "k.txt").write_text(KEY)

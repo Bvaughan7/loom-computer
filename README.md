@@ -83,6 +83,10 @@ Design:
   output bytes). That is byte-level matching of the value as UTF-8 (and its
   JSON-escaped spelling): a value a file holds re-encoded (base64, compressed,
   split across lines, UTF-16) is not recognized.
+  *Accepted limit:* the `X-Loom-Truncated` header comes from a probe made
+  before streaming starts, so it reflects the mask set at probe time and can
+  be stale if grants change mid-download. The body is always masked with the
+  live set and always capped at `max_bytes`; only that header can be stale.
 - **Known limits (design questions, left as they are).**
   Variables are in the environment of *every* job, so any job can read and
   print or transform them; redaction only catches the plain forms. The

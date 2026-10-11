@@ -20,7 +20,11 @@ What is enforced, and where:
 * An approval is bound to the one parked ceremony: its tab, its rpId and its
   nonce. The first credential added on that tab for that rpId is the mint (a
   non-resident credential has no user handle to match); any other, even while
-  the approval is in flight, is removed at once.
+  the approval is in flight, is removed at once. Before the create is
+  released the tab's authenticator is emptied, so the first credential added
+  after that is the ceremony's, not a stray one a page had in flight.
+* A tab whose page guard could not be verified in place denies every ask, and
+  a nonce is good for one ask only.
 * The page script is the first line only. A credential that appears in an
   authenticator without an approval for this very arming, or for another site,
   or after the ten minutes, is removed (on its event and on every look).
@@ -49,7 +53,7 @@ _RP_ID = re.compile(r"[a-z0-9]([a-z0-9.-]*[a-z0-9])?\Z")
 _GUARD = """(binding, nonce) => {
   const proto = window.CredentialsContainer && CredentialsContainer.prototype;
   const ask = window[binding];
-  if (!proto || typeof ask !== 'function' || typeof proto.create !== 'function') return;
+  if (!proto || typeof ask !== 'function' || typeof proto.create !== 'function') return false;
   const original = proto.create;
   const originalGet = proto.get;
   const pending = new Map();
@@ -59,15 +63,18 @@ _GUARD = """(binding, nonce) => {
   const guarded = function create(options) {
     // One read of publicKey: a getter that answers differently the second
     // time must not get a second look. What goes to the native create is a
-    // copy holding exactly what was read here.
+    // copy holding exactly what was read here; the original is never spread.
     const pk = options ? options.publicKey : undefined;
     const self = this;
-    const opts = options ? Object.assign({}, options) : options;
-    if (!pk) {
-      if (opts) delete opts.publicKey;
-      return original.call(self, opts);
+    let opts = options;
+    if (options) {
+      opts = {};
+      for (const key of Object.keys(options)) {
+        if (key !== 'publicKey') opts[key] = options[key];
+      }
+      if (pk) opts.publicKey = pk;
     }
-    opts.publicKey = pk;
+    if (!pk) return original.call(self, opts);
     return new Promise((resolve, reject) => {
       const id = newId();
       const askNonce = newId();
@@ -114,10 +121,22 @@ _GUARD = """(binding, nonce) => {
   Object.defineProperty(proto, 'create', {value: guarded, configurable: true, writable: true});
   if (typeof originalGet === 'function')
     Object.defineProperty(proto, 'get', {value: guardedGet, configurable: true, writable: true});
+  // The guard reports whether it is really in place: both hooks must be ours.
+  // A page that got to the names first leaves this false, and the computer
+  // then refuses every ask from the tab.
+  let ok = true;
   try { Object.defineProperty(window, '__loomRelease',
         {value: release, configurable: false, writable: false}); } catch (e) {}
   try { Object.defineProperty(window, '__loomParked',
         {value: parked, configurable: false, writable: false}); } catch (e) {}
+  try {
+    ok = window.__loomRelease === release && window.__loomParked === parked &&
+         proto.create === guarded;
+  } catch (e) { ok = false; }
+  // Tell the computer, with the tab's secret: a fresh document is guarded by
+  // the new-document script, which no page script can run ahead of.
+  try { ask(JSON.stringify({kind: 'guard', secret: nonce, ok})); } catch (e) {}
+  return ok;
 }"""
 
 
@@ -188,6 +207,7 @@ class _Tab:
     reader: asyncio.Task | None = None
     background: set = field(default_factory=set)
     closed: bool = False
+    guarded: bool = False  # the page guard is verified in place (fail closed)
 
 
 @dataclass
@@ -219,6 +239,7 @@ class Passkeys:
         self._tabs: dict[str, _Tab] = {}
         self._reg: _Registration | None = None
         self._parked: dict[str, _Parked] = {}  # nonce -> the request it names
+        self._seen: dict[str, None] = {}  # nonces already asked with: single-use
         self._loop: asyncio.AbstractEventLoop | None = None
         self._runner: asyncio.Task | None = None
         self._attach_lock: asyncio.Lock | None = None
@@ -233,6 +254,7 @@ class Passkeys:
             return
         self._tabs.clear()
         self._parked.clear()
+        self._seen.clear()
         self._loop, self._attach_lock = loop, asyncio.Lock()
         self._runner = loop.create_task(self._watch())
 
@@ -311,7 +333,12 @@ class Passkeys:
             await tab.conn.call("Page.enable")
             source = f"({_GUARD})({json.dumps(BINDING)}, {json.dumps(tab.nonce)})"
             await tab.conn.call("Page.addScriptToEvaluateOnNewDocument", {"source": source})
-            await tab.conn.call("Runtime.evaluate", {"expression": source})
+            installed = await tab.conn.call("Runtime.evaluate", {
+                "expression": source, "returnByValue": True})
+            tab.guarded = installed.get("result", {}).get("value") is True
+            if not tab.guarded:
+                log.warning("passkey guard could not be verified on a tab; "
+                            "its creates will be denied")
             self._tabs[tab.target] = tab
             await self._sync(tab)
         except BaseException:
@@ -493,6 +520,10 @@ class Passkeys:
         context = params.get("executionContextId")
         try:
             raw = json.loads(params.get("payload", ""))
+            if raw.get("kind") == "guard":  # the guard's own report of itself
+                if raw.get("secret") == tab.nonce:
+                    tab.guarded = raw.get("ok") is True
+                return
             ident = raw["id"]
             if not isinstance(ident, str) or not re.fullmatch(r"[0-9a-f]{32}", ident):
                 return
@@ -506,10 +537,14 @@ class Passkeys:
                 await self._release(tab, context, ident, "allow")
                 return
             nonce = raw.get("nonce")
-            if (not isinstance(nonce, str) or not re.fullmatch(r"[0-9a-f]{32}", nonce)
-                    or nonce in self._parked):
+            if (not tab.guarded or not isinstance(nonce, str)
+                    or not re.fullmatch(r"[0-9a-f]{32}", nonce)
+                    or nonce in self._parked or nonce in self._seen):
                 await self._release(tab, context, ident, "deny")
                 return
+            self._seen[nonce] = None
+            while len(self._seen) > 4096:
+                del self._seen[next(iter(self._seen))]
             held = await tab.conn.call("Runtime.evaluate", {
                 "expression": (f"window.__loomParked && window.__loomParked("
                                f"{json.dumps(ident)}, {json.dumps(nonce)}, "
@@ -612,6 +647,14 @@ class Passkeys:
             out["passkey"] = reg.passkey
         return out
 
+    async def _clean_slate(self, tab: _Tab) -> None:
+        got = await tab.conn.call("WebAuthn.getCredentials",
+                                  {"authenticatorId": tab.authenticator})
+        for credential in got.get("credentials", []):
+            await tab.conn.call("WebAuthn.removeCredential", {
+                "authenticatorId": tab.authenticator,
+                "credentialId": credential["credentialId"]})
+
     async def answer(self, ident, approved: bool) -> bool:
         """False when no such request is waiting (the route answers 409)."""
         self._expire()
@@ -622,12 +665,23 @@ class Passkeys:
         if parked is None:
             return False
         if approved:
-            reg.status, reg.parked = "approved", None
-            reg.approved = (parked.tab, parked.rp_id, nonce)
+            reg.status, reg.parked, reg.approved = "approved", None, None
             try:
                 await self._settle(parked.tab, parked.context)
             except Exception:  # noqa: BLE001 - the page's create() goes ahead regardless
                 log.debug("could not ready a registration", exc_info=True)
+            try:
+                await self._clean_slate(parked.tab)
+            except Exception:  # noqa: BLE001 - no clean slate, no mint: fail closed
+                log.debug("could not clear the authenticator", exc_info=True)
+                if self._reg is reg:
+                    self._reg = None
+                await self._release(parked.tab, parked.context, parked.ident, "deny")
+                return True
+            # Only now does the approval name a ceremony: the first credential
+            # added after the clean slate is the one the released create mints.
+            if self._reg is reg:
+                reg.approved = (parked.tab, parked.rp_id, nonce)
             await self._release(parked.tab, parked.context, parked.ident, "allow")
         else:
             self._reg = None
