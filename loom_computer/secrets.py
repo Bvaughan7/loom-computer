@@ -1,0 +1,313 @@
+"""The granted secret set: held in memory only, never answered back.
+
+`PUT /secrets` replaces the whole set. Nothing here writes to disk, logs a
+value, or echoes one in an error: a refusal names the secret and the shape
+that was wrong, never what it held.
+"""
+
+import base64
+import binascii
+import hmac
+import logging
+import re
+import struct
+import time
+from dataclasses import dataclass
+from urllib.parse import urlsplit
+
+from .errors import ToolError
+
+REDACTED = "[REDACTED]"
+_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+_HOST = re.compile(r"[a-z0-9]([a-z0-9.-]*[a-z0-9])?\Z")
+
+
+class SecretsError(ValueError):
+    """A set that cannot be taken. The message never holds a secret value."""
+
+
+def b64_bytes(value: str) -> bytes:
+    """Bytes of a base64 or base64url string, padding optional."""
+    text = value.strip().replace("-", "+").replace("_", "/")
+    text += "=" * (-len(text) % 4)
+    return base64.b64decode(text, validate=True)
+
+
+def b64_std(value: str) -> str:
+    return base64.b64encode(b64_bytes(value)).decode("ascii")
+
+
+@dataclass(frozen=True)
+class Login:
+    name: str
+    sites: tuple[str, ...]
+    username: str
+    password: str
+    totp: str | None = None
+
+    def totp_code(self, now: float | None = None) -> str:
+        if not self.totp:
+            raise ToolError("this login has no totp secret")
+        return totp_code(self.totp, time.time() if now is None else now)
+
+
+@dataclass(frozen=True)
+class Passkey:
+    name: str
+    rp_id: str
+    credential_id: str  # standard base64, as the WebAuthn domain wants it
+    private_key: str
+    user_handle: str | None = None
+    user_name: str | None = None
+    user_display_name: str | None = None
+
+    @property
+    def key(self) -> bytes:
+        return b64_bytes(self.credential_id)
+
+
+def totp_code(secret: str, now: float, digits: int = 6, step: int = 30) -> str:
+    """RFC 6238, SHA-1. `secret` is base32 (spaces and case ignored) or an
+    otpauth:// URI carrying one."""
+    if secret.lower().startswith("otpauth://"):
+        match = re.search(r"[?&]secret=([^&]+)", secret, re.I)
+        secret = match.group(1) if match else ""
+    text = re.sub(r"[\s-]", "", secret).upper()
+    try:
+        key = base64.b32decode(text + "=" * (-len(text) % 8))
+    except (binascii.Error, ValueError):
+        raise ToolError("the totp secret is not valid base32") from None
+    digest = hmac.digest(key, struct.pack(">Q", int(now // step)), "sha1")
+    offset = digest[-1] & 0x0F
+    number = struct.unpack(">I", digest[offset:offset + 4])[0] & 0x7FFFFFFF
+    return str(number % 10 ** digits).zfill(digits)
+
+
+def _site(entry: str) -> tuple[str | None, str, int | None]:
+    """(scheme or None, host, port or None) of a login's site entry: a bare
+    host (`example.com`), a host with port, or an origin/URL."""
+    text = entry.strip().lower()
+    if "://" not in text:
+        text = "//" + text
+    try:
+        parts = urlsplit(text)
+        host, port = parts.hostname, parts.port
+    except ValueError:
+        raise SecretsError("a login site is not a host or origin") from None
+    scheme = parts.scheme or None
+    if scheme not in (None, "http", "https") or not host or not _HOST.match(host):
+        raise SecretsError("a login site is not a host or origin")
+    return scheme, host, port
+
+
+def site_allows(sites: tuple[str, ...], origin: str) -> bool:
+    """May a login with these sites be typed on a page of `origin`?
+
+    A site entry covers its own host and the hosts within it. A bare host
+    means https (plain http only for localhost, which is not an interception
+    risk); an entry written with a scheme or port must match those as well.
+    An opaque origin ("null"), any non-web scheme, or an unparsable one is
+    never allowed.
+    """
+    try:
+        page = urlsplit(origin)
+        page_host, page_port = page.hostname, page.port
+    except ValueError:
+        return False
+    if page.scheme not in ("http", "https") or not page_host:
+        return False
+    page_host = page_host.lower()
+    default = 443 if page.scheme == "https" else 80
+    for entry in sites:
+        scheme, host, port = _site(entry)
+        if page_host != host and not page_host.endswith("." + host):
+            continue
+        if scheme is not None and scheme != page.scheme:
+            continue
+        if port is not None and port != (page_port or default):
+            continue
+        if scheme is None and page.scheme != "https" and host not in ("localhost", "127.0.0.1"):
+            continue
+        return True
+    return False
+
+
+def _string(record: dict, key: str, name: str, required: bool = True) -> str | None:
+    value = record.get(key)
+    if value is None and not required:
+        return None
+    if not isinstance(value, str) or not value:
+        raise SecretsError(f"secret {_shown(name)}: {key} must be a non-empty string")
+    return value
+
+
+def _shown(name: str) -> str:
+    return re.sub(r"[^\x20-\x7e]", "?", name)[:64]
+
+
+class SecretStore:
+    """The set, and everything derived from it. Replaced whole, atomically."""
+
+    def __init__(self):
+        self.variables: dict[str, str] = {}
+        self.logins: dict[str, Login] = {}
+        self.passkeys: dict[str, Passkey] = {}
+        self._needles: list[tuple[str, str]] = []
+        self._listeners: list = []
+        self.extra: set[str] = set()  # minted-but-not-yet-delivered values to redact
+
+    # -- loading --------------------------------------------------------------
+
+    def replace(self, payload) -> dict:
+        """Take the whole set or none of it. Returns counts, never values."""
+        if not isinstance(payload, dict):
+            raise SecretsError("the body must be a JSON object of name to secret")
+        variables: dict[str, str] = {}
+        logins: dict[str, Login] = {}
+        passkeys: dict[str, Passkey] = {}
+        for name, value in payload.items():
+            if not isinstance(name, str) or not name:
+                raise SecretsError("a secret needs a non-empty name")
+            if isinstance(value, str):
+                variables[name] = value
+            elif isinstance(value, dict):
+                kind = value.get("kind")
+                if kind == "login":
+                    logins[name] = self._login(name, value)
+                elif kind == "passkey":
+                    passkeys[name] = self._passkey(name, value)
+                else:
+                    raise SecretsError(f"secret {_shown(name)}: unknown kind")
+            else:
+                raise SecretsError(f"secret {_shown(name)}: must be a string or a typed record")
+        self.variables, self.logins, self.passkeys = variables, logins, passkeys
+        self._rebuild()
+        for listener in list(self._listeners):
+            listener()
+        return {"variables": len(variables), "logins": len(logins),
+                "passkeys": len(passkeys)}
+
+    @staticmethod
+    def _login(name: str, record: dict) -> Login:
+        sites = record.get("sites")
+        if (not isinstance(sites, list) or not sites
+                or not all(isinstance(s, str) and s.strip() for s in sites)):
+            raise SecretsError(f"secret {_shown(name)}: sites must be a non-empty list of hosts")
+        for site in sites:
+            _site(site)
+        username = _string(record, "username", name)
+        password = _string(record, "password", name)
+        totp = _string(record, "totp", name, required=False)
+        if totp is not None:
+            try:
+                totp_code(totp, 0)
+            except ToolError:
+                raise SecretsError(f"secret {_shown(name)}: totp is not valid base32") from None
+        return Login(name, tuple(s.strip() for s in sites), username, password, totp)
+
+    @staticmethod
+    def _passkey(name: str, record: dict) -> Passkey:
+        rp_id = _string(record, "rpId", name).lower()
+        fields = {}
+        for key in ("credentialId", "privateKey", "userHandle"):
+            value = _string(record, key, name, required=key != "userHandle")
+            if value is not None:
+                try:
+                    fields[key] = b64_std(value)
+                except (binascii.Error, ValueError):
+                    raise SecretsError(
+                        f"secret {_shown(name)}: {key} must be base64") from None
+        extras = [_string(record, key, name, required=False)
+                  for key in ("userName", "userDisplayName")]
+        return Passkey(name, rp_id, fields["credentialId"], fields["privateKey"],
+                       fields.get("userHandle"), *extras)
+
+    def on_change(self, listener) -> None:
+        self._listeners.append(listener)
+
+    # -- redaction ------------------------------------------------------------
+
+    def _values(self) -> set[str]:
+        values = set(self.variables.values()) | self.extra
+        for login in self.logins.values():
+            values.update((login.username, login.password))
+            if login.totp:
+                values.add(login.totp)
+        for key in self.passkeys.values():
+            values.update(v for v in (key.private_key, key.credential_id,
+                                      key.user_handle) if v)
+        return {v for v in values if v}
+
+    def _rebuild(self) -> None:
+        # Longest first, so a value that holds another is masked whole. Each
+        # value is also masked as a JSON string body would carry it.
+        needles = set()
+        for value in self._values():
+            needles.add(value)
+            escaped = value.replace("\\", "\\\\").replace('"', '\\"') \
+                .replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
+            needles.add(escaped)
+        self._needles = [(n, REDACTED) for n in sorted(needles, key=len, reverse=True)]
+
+    def remember(self, value: str) -> None:
+        """Add a value minted at runtime (a new passkey's key) to the masks."""
+        self.extra.add(value)
+        self._rebuild()
+
+    def redact(self, text: str) -> str:
+        for needle, mask in self._needles:
+            if needle in text:
+                text = text.replace(needle, mask)
+        return text
+
+    def redact_json(self, node):
+        if isinstance(node, str):
+            return self.redact(node)
+        if isinstance(node, list):
+            return [self.redact_json(v) for v in node]
+        if isinstance(node, dict):
+            return {self.redact(k) if isinstance(k, str) else k: self.redact_json(v)
+                    for k, v in node.items()}
+        return node
+
+    def redact_result(self, result: dict) -> dict:
+        """An MCP result with every secret masked in its text and structured
+        content. Image blocks are pixels and pass as they are."""
+        if not self._needles:
+            return result
+        out = dict(result)
+        out["content"] = [
+            {**block, "text": self.redact(block["text"])} if block.get("type") == "text"
+            and isinstance(block.get("text"), str) else block
+            for block in result.get("content", [])]
+        if "structuredContent" in result:
+            out["structuredContent"] = self.redact_json(result["structuredContent"])
+        return out
+
+    def log_filter(self) -> logging.Filter:
+        return SecretMask(self)
+
+
+class SecretMask(logging.Filter):
+    """Masks granted values in a log record's message and traceback."""
+
+    def __init__(self, store: SecretStore):
+        super().__init__()
+        self.store = store
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        store = self.store
+        if not store._needles:
+            return True
+        message = record.getMessage()
+        masked = store.redact(message)
+        if masked != message:
+            record.msg, record.args = masked, ()
+        if record.exc_info and not record.exc_text:
+            record.exc_text = logging.Formatter().formatException(record.exc_info)
+        if record.exc_text:
+            record.exc_text = store.redact(record.exc_text)
+            record.exc_info = None
+        if record.stack_info:
+            record.stack_info = store.redact(record.stack_info)
+        return True

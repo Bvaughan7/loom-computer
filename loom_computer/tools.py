@@ -17,12 +17,14 @@ from .browser import Browser
 from .desktop import Desktop
 from .errors import ToolError
 from .jobs import Jobs, base_env, clamp_timeout, workspace_env
+from .secrets import SecretStore
 from .workspace import Workspace
 
 log = logging.getLogger("loom_computer")
 
 MAX_IMAGE_EDGE = 1568
 CAPTURE_MODES = ("image", "png", "tree")
+_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 INTERPRETERS = {".py": "python3", ".sh": "bash"}
 
 
@@ -72,13 +74,19 @@ DEFINITIONS = [
     {"name": "browser",
      "description": "Drive the desktop's Chromium (the active tab). Actions: "
                     "navigate (url), title, text (optional selector), fill "
-                    "(selector, value), click (selector).",
+                    "(selector, value; or selector and secret, the name of a saved "
+                    "login, with field username|password|totp), click (selector).",
      "inputSchema": _schema({
          "action": {"type": "string",
                     "enum": ["navigate", "title", "text", "fill", "click"]},
          "url": {"type": "string"},
          "selector": {"type": "string", "description": "CSS selector."},
-         "value": {"type": "string", "description": "fill: the text to enter."}},
+         "value": {"type": "string", "description": "fill: the text to enter."},
+         "secret": {"type": "string", "description":
+                    "fill: name of a granted login to type instead of `value`; "
+                    "only works on a page of that login's own sites."},
+         "field": {"type": "string", "enum": ["username", "password", "totp"],
+                   "description": "fill with `secret`: which part (default password)."}},
          ("action",))},
     {"name": "capture",
      "description": "Look at the computer. mode `image`: screenshot scaled to "
@@ -119,8 +127,9 @@ def _pick(args: dict, allowed: tuple) -> None:
 
 class Tools:
     def __init__(self, guide, desktop: Desktop, workspace: str,
-                 browser: Browser | None = None):
+                 browser: Browser | None = None, secrets: SecretStore | None = None):
         self._guide = guide
+        self.secrets = secrets or SecretStore()
         self._desktop = desktop
         self.workspace = Workspace(workspace)
         self.browser = browser or Browser()
@@ -135,12 +144,14 @@ class Tools:
     async def call(self, name: str, args: dict) -> dict:
         handler = getattr(self, f"_{name}")
         try:
-            return await handler(args)
+            result = await handler(args)
         except ToolError as exc:
-            return _error(f"{name}: {exc}")
+            result = _error(f"{name}: {exc}")
         except Exception as exc:  # noqa: BLE001 - a tool bug is an answer, not a 500
             log.exception("tool %s failed", name)
-            return _error(f"{name}: unexpected {type(exc).__name__}; the call was not completed")
+            result = _error(f"{name}: unexpected {type(exc).__name__}; the call was not completed")
+        # Every answer passes here: no granted value leaves in a tool result.
+        return self.secrets.redact_result(result)
 
     # -- state ----------------------------------------------------------------
 
@@ -156,6 +167,11 @@ class Tools:
     def _job_env(self) -> dict[str, str]:
         env = base_env(self._desktop.display)
         env.update(workspace_env(self.workspace.root))
+        # Granted variables: of every job, never of the workspace's env file
+        # (which a preparation job's environment is written to) and never
+        # the computer's own variables.
+        env.update({k: v for k, v in self.secrets.variables.items()
+                    if _NAME.match(k) and not k.startswith("LOOM_COMPUTER")})
         return env
 
     def _cwd(self, value) -> str:
@@ -237,7 +253,7 @@ class Tools:
     # -- browser --------------------------------------------------------------
 
     async def _browser(self, args: dict) -> dict:
-        _pick(args, ("action", "url", "selector", "value"))
+        _pick(args, ("action", "url", "selector", "value", "secret", "field"))
         action, b = args.get("action"), self.browser
         if action == "navigate":
             return text_result(await b.navigate(args.get("url")))
@@ -246,12 +262,26 @@ class Tools:
         if action == "text":
             return text_result(await b.text(args.get("selector")))
         if action == "fill":
-            return text_result(await b.fill(args.get("selector"), args.get("value")))
+            return text_result(await self._fill(args))
         if action == "click":
             return text_result(await b.click(args.get("selector")))
         shown = _printable(action) if isinstance(action, str) else ""
         raise ToolError(f"unknown action {shown} "
                         "(one of: navigate, title, text, fill, click)")
+
+    async def _fill(self, args: dict) -> dict:
+        secret, value, field = args.get("secret"), args.get("value"), args.get("field")
+        if secret is None:
+            if field is not None:
+                raise ToolError("field applies to fill with `secret`")
+            return await self.browser.fill(args.get("selector"), value)
+        if value is not None:
+            raise ToolError("give `value` or `secret`, not both")
+        login = self.secrets.logins.get(secret) if isinstance(secret, str) else None
+        if login is None:
+            raise ToolError("no granted login by that name")
+        return await self.browser.fill_secret(args.get("selector"), login,
+                                              "password" if field is None else field)
 
     # -- capture --------------------------------------------------------------
 

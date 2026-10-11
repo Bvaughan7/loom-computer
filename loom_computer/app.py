@@ -23,6 +23,8 @@ from . import VERSION
 from .browser import Browser
 from .desktop import Desktop, FrameHub, InputSession
 from .errors import ToolError
+from .passkeys import Passkeys, valid_rp_id
+from .secrets import SecretMask, SecretStore, SecretsError
 from .tools import DEFINITIONS, Tools
 
 PORT = 8787
@@ -172,17 +174,29 @@ def create_app(token: str, desktop: Desktop | None = None,
     if not token:
         raise ValueError("LOOM_COMPUTER_TOKEN must be a non-empty token")
     desktop = desktop or Desktop()
+    browser = browser or Browser()
+    store = SecretStore()
+    passkeys = Passkeys(store, browser.endpoint)
+    browser.before_page = passkeys.attach_all  # a new tab has its authenticator first
+    package_log = logging.getLogger("loom_computer")
+    for old in [f for f in package_log.filters if isinstance(f, SecretMask)]:
+        package_log.removeFilter(old)  # one app, one set (tests make many)
+    package_log.addFilter(store.log_filter())
     tools = Tools(guide, desktop,
-                  workspace or os.environ.get("LOOM_WORKSPACE", WORKSPACE), browser)
+                  workspace or os.environ.get("LOOM_WORKSPACE", WORKSPACE), browser, store)
 
     @contextlib.asynccontextmanager
     async def lifespan(_app):
+        passkeys.start()
         yield
+        await passkeys.stop()
         tools.shutdown()  # no job outlives the API
 
     app = FastAPI(title="Loom Computer", version=VERSION, lifespan=lifespan,
                   docs_url=None, redoc_url=None, openapi_url=None)
 
+    app.state.secrets = store
+    app.state.passkeys = passkeys
     hub = FrameHub(desktop)
     viewer_html, viewer_csp = _viewer_page()
 
@@ -229,6 +243,56 @@ def create_app(token: str, desktop: Desktop | None = None,
             return JSONResponse(None, status_code=202)
         invalid = response.get("error", {}).get("code") == INVALID_REQUEST
         return JSONResponse(response, status_code=400 if invalid else 200)
+
+    async def _json_body(request: Request):
+        # Parsed by hand: a framework validation error would echo the input.
+        try:
+            return json.loads(await request.body())
+        except ValueError:
+            return None
+
+    def _bad(message: str, status: int = 400) -> JSONResponse:
+        return JSONResponse({"error": message}, status_code=status)
+
+    @app.put("/secrets")
+    async def put_secrets(request: Request):
+        """The whole granted set, replacing the last. Held in memory only; no
+        route answers a value back."""
+        try:
+            counts = store.replace(await _json_body(request))
+        except SecretsError as exc:
+            return _bad(str(exc))
+        passkeys.start()
+        log.info("secrets replaced: %d variables, %d logins, %d passkeys",
+                 counts["variables"], counts["logins"], counts["passkeys"])
+        return {"ok": True, **counts}
+
+    @app.put("/passkeys/registration")
+    async def arm_registration(request: Request):
+        body = await _json_body(request)
+        rp_id = body.get("rpId") if isinstance(body, dict) else None
+        if not valid_rp_id(rp_id):
+            return _bad("rpId must be a host name")
+        return await passkeys.arm(rp_id.lower())
+
+    @app.get("/passkeys/registration")
+    async def registration_status():
+        return passkeys.status()
+
+    @app.delete("/passkeys/registration")
+    async def disarm_registration():
+        await passkeys.disarm()
+        return {"status": "idle"}
+
+    @app.post("/passkeys/registration/answer")
+    async def answer_registration(request: Request):
+        body = await _json_body(request)
+        if (not isinstance(body, dict) or not isinstance(body.get("id"), str)
+                or not isinstance(body.get("approved"), bool)):
+            return _bad('body must be {"id": string, "approved": boolean}')
+        if not await passkeys.answer(body["id"], body["approved"]):
+            return _bad("no such request is waiting", 409)
+        return passkeys.status()
 
     @app.get("/files/download")
     async def download(path: str = "", max_bytes: str | None = None):
@@ -361,14 +425,16 @@ class _RedactToken(logging.Filter):
         return True
 
 
-def log_config() -> dict:
+def log_config(store: SecretStore | None = None) -> dict:
     """Uvicorn's logging config with token redaction on every handler."""
     from uvicorn.config import LOGGING_CONFIG
 
     config = copy.deepcopy(LOGGING_CONFIG)
     config["filters"] = {"redact_token": {"()": _RedactToken}}
+    if store is not None:
+        config["filters"]["redact_secrets"] = {"()": store.log_filter}
     for handler in config["handlers"].values():
-        handler["filters"] = ["redact_token"]
+        handler["filters"] = list(config["filters"])
     return config
 
 
@@ -380,5 +446,8 @@ def main() -> None:
     if not token:
         sys.exit("loom-computer: LOOM_COMPUTER_TOKEN is not set; refusing to start "
                  "(every /mcp call needs a bearer token)")
-    uvicorn.run(create_app(token), host="0.0.0.0", port=PORT, log_level="info",
-                access_log=False, log_config=log_config())
+    app = create_app(token)
+    for handler in logging.getLogger().handlers:
+        handler.addFilter(app.state.secrets.log_filter())
+    uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="info",
+                access_log=False, log_config=log_config(app.state.secrets))

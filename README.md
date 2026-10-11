@@ -27,8 +27,75 @@ loopback). The server refuses to start if `LOOM_COMPUTER_TOKEN` is unset.
 Nothing runs as root: the image uses the `agent` user (UID 1000) with
 `/home/agent/workspace` as its working directory.
 
-Not yet implemented: `PUT /secrets`, `/passkeys/registration`,
-`DELETE /logins/{name}`, `state login_load`.
+Phase 3 adds the secrets routes below. Not implemented (not in Phase 3's
+scope): `DELETE /logins/{name}` and `state login_load`.
+
+### `state login_load` (left unimplemented, deliberately)
+
+The contract names it once, as how the desk's cookie import
+(`import-<browser>-<profile>`) is "loaded", and defines nothing else: not its
+arguments, not where a saved login's cookies are kept, not what it answers.
+Inventing a store and a format here would be guessing at an interface the
+desk has to match byte for byte, so `state` still answers
+`state: unknown action login_load`. `DELETE /logins/{name}` is its
+counterpart and is left for the same reason (and the 404 it answers is the
+contract's own signal that a release predates it).
+
+## Secrets (Phase 3)
+
+| Route | Behavior |
+| --- | --- |
+| `PUT /secrets` | Bearer. The whole granted set, a JSON object of name to secret, replacing the last. A string is a variable; `{"kind":"login","sites":[...],"username","password","totp"?}`; `{"kind":"passkey","rpId","credentialId","privateKey","userHandle"?,"userName"?,"userDisplayName"?}` (`credentialId`, `privateKey`, `userHandle` base64 or base64url; `totp` base32 or an `otpauth://` URI). Answers `200 {"ok":true,"variables":n,"logins":n,"passkeys":n}`; a malformed set is `400 {"error"}` (naming the secret and the field, never a value) and leaves the previous set. There is **no GET**. |
+| `PUT /passkeys/registration` | Bearer. `{"rpId"}` arms the computer for ten minutes for that site and readies the browser (a tab exists, authenticators attached). `200 {"status":"armed","rpId","expiresAt"}`. |
+| `GET /passkeys/registration` | `{"status":"idle"}`, `{"status":"armed",...}`, `{"status":"asked","ask":{id,rpId,origin,rpName?,userName?,userDisplayName?,askedAt}}`, `{"status":"approved"}`, then `{"status":"registered","passkey":{kind,rpId,credentialId,privateKey,userHandle?,userName?,userDisplayName?}}`. |
+| `POST /passkeys/registration/answer` | `{"id","approved"}`. 409 when that request is not waiting (including after expiry). Denied: the site gets `NotAllowedError` and the arming ends. |
+| `DELETE /passkeys/registration` | Ends the arming (the desk does this after storing the passkey). |
+
+Design:
+
+- **Memory only.** The set lives in `SecretStore` (`loom_computer/secrets.py`);
+  nothing touches disk and a restart clears it. Routes parse bodies by hand so
+  a framework validation error can never echo a value.
+- **Variables** are merged into the environment of every `shell` / `files
+  run` job (`Tools._job_env`) after the workspace's `.loom/env`, skipping
+  names that are not valid identifiers and `LOOM_COMPUTER*`. They are never
+  written to the workspace, so the desk's preparation-job environment
+  (`.loom/env`) cannot contain them. Jobs still get an environment built from
+  constants, so they never inherit the bearer.
+- **Redaction.** Every tool answer (text blocks and structured content,
+  errors included) has each granted value (variables, logins' username /
+  password / totp secret, passkeys' key material) replaced by `[REDACTED]`,
+  also in its JSON-escaped form; log records are masked the same way. Limits:
+  screenshots are pixels, and a job that re-encodes a value (base64, reversal)
+  can print a form the mask does not know.
+- **Logins.** `browser fill {selector, secret, field?}`; the page origin is
+  read and checked against `sites` and the typing happens in the same page
+  evaluation guarded by that origin, so a navigation cannot slip between. A
+  site entry covers its host and hosts within it; a bare host means https
+  (plain http only for `localhost`/`127.0.0.1`); an entry with a scheme or
+  port must match those too.
+- **Passkeys.** A background watcher keeps one long-lived DevTools socket per
+  tab (a virtual authenticator exists only as long as the socket that made
+  it), with a CTAP2 internal authenticator with automatic presence/verification
+  simulation, loaded with the granted passkeys; tabs are attached again
+  before any browser tool call and every second. Two Chromium behaviors
+  shape this (found against the real browser): its window has no OS focus in
+  this desktop, and a WebAuthn ceremony waits for a focused page, so the
+  showing tab is brought to front (no tab is switched); and the browser
+  drops the WebAuthn domain's state around every navigation's load, which
+  orphans a ceremony started before it. The page script therefore holds each
+  `get()` (and an approved `create()`) until the document has loaded and the
+  authenticator has survived it, then lets it through; a `get()` the computer
+  never answers goes ahead after 8 s.
+- **Registration guard.** A script injected in every document wraps
+  `CredentialsContainer.prototype.create` and reports through a CDP binding;
+  the computer decides. Only while armed, for that rpId, from an origin within
+  it, one at a time, is a request parked (`asked`); everything else gets a
+  `NotAllowedError` immediately. On approval the page's own `create()` runs
+  and the authenticator's `credentialAdded` event yields the record. Anything
+  that appears in an authenticator without an approval for this arming (or for
+  another site, or after expiry) is removed on its event and on every look.
+  Minted key material joins the redaction masks.
 
 ## The tools (Phase 2)
 
@@ -40,7 +107,7 @@ serves; that file is the reference. Summary:
 | `state` | `action: "guide"` | `name`, `version`, `sha256`, `skill`. Any other action: `state: unknown action <action>`. |
 | `shell` | exactly one of `command` (run by `bash -c`) or `argv` (list, no shell); `cwd`, `timeout` (default 120 s, max 3600) | JSON text: `exit_code`, `stdout`, `stderr`, `timed_out`, `truncated`, `duration_s`. |
 | `files` | `action` read / write / list / run; `path`; `content`, `encoding` (utf-8/base64), `append`; run: `args`, `cwd`, `timeout` | read/write/list JSON; run answers like `shell`. Confined to `/home/agent/workspace` (symlinks resolved first). |
-| `browser` | `action` navigate / title / text / fill / click; `url`, `selector`, `value` | JSON text. Drives the Phase 1 Chromium over CDP. |
+| `browser` | `action` navigate / title / text / fill / click; `url`, `selector`, `value`; fill also `secret` (a granted login's name) with `field` username / password / totp | JSON text. Drives the Phase 1 Chromium over CDP. |
 | `capture` | `mode` image (<= 1568 px longer edge) / png / tree; `window`, `region` `[x,y,w,h]` | `image`/`png`: an MCP image block plus a text note of the scale. `tree`: accessibility tree as text. |
 
 Design choices:
@@ -138,7 +205,7 @@ python -m pytest
 0. **Skeleton**: health, MCP stub, guide, viewer and socket stubs, image. (this)
 1. **Desktop + viewer streaming**: a real X desktop, the viewer page and `/ws`. (this)
 2. **MCP tools**: `state`, `shell`, `files`, `browser`, and friends over `/mcp`.
-3. **Secrets**: `PUT /secrets`, logins, passkeys, redaction.
+3. **Secrets**: `PUT /secrets`, logins, passkeys, redaction. (this)
 4. **Release pipeline**: tagged releases published to GHCR.
 5. **Three-agent integration test**: three teammates sharing one computer
    with leases and queued runs.

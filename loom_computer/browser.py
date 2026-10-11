@@ -13,6 +13,7 @@ import os
 import urllib.request
 
 from .errors import ToolError
+from .secrets import site_allows
 
 DEFAULT_ENDPOINT = "http://127.0.0.1:9222"
 NAVIGATE_TIMEOUT = 30.0
@@ -44,6 +45,13 @@ _FILL = """(selector, value) => {
   fire('input'); fire('change');
   return {filled: tag.toLowerCase()};
 }"""
+
+# `_FILL`, but only when the page is still the origin that was checked: the
+# check and the typing are one evaluation, so a navigation cannot slip between.
+_FILL_AT = f"""(selector, value, origin) => {{
+  if (location.origin !== origin) return {{error: 'the page changed; nothing was typed'}};
+  return ({_FILL})(selector, value);
+}}"""
 
 _CENTER = """(selector) => {
   const el = document.querySelector(selector);
@@ -123,6 +131,7 @@ class Browser:
     def __init__(self, endpoint: str | None = None):
         self.endpoint = endpoint or os.environ.get("LOOM_CDP_ENDPOINT", DEFAULT_ENDPOINT)
         self._lock = asyncio.Lock()
+        self.before_page = None  # async callable: runs before a tab is chosen
 
     async def _pages(self) -> list[dict]:
         try:
@@ -171,6 +180,8 @@ class Browser:
         from websockets.exceptions import WebSocketException
 
         async with self._lock:
+            if self.before_page is not None:
+                await self.before_page()
             for attempt in (1, 2):
                 url = await self._target()
                 started = False
@@ -228,6 +239,26 @@ class Browser:
 
         async def work(page: _Session):
             return await page.evaluate(_FILL, selector, value)
+        return await self._with_page(work)
+
+    async def fill_secret(self, selector, login, field: str) -> dict:
+        """Type one field of a saved login, only on a page of its own sites."""
+        _check_selector(selector)
+        if field not in ("username", "password", "totp"):
+            raise ToolError('field must be "username", "password" or "totp"')
+
+        async def work(page: _Session):
+            origin = await page.evaluate("() => location.origin")
+            if not isinstance(origin, str) or not site_allows(login.sites, origin):
+                shown = origin if isinstance(origin, str) and origin != "null" else "this page"
+                raise ToolError(f"login {login.name!r} is not for {shown[:200]}; "
+                                "nothing was typed")
+            value = {"username": login.username, "password": login.password,
+                     "totp": login.totp_code if field == "totp" else None}[field]
+            if field == "totp":
+                value = value()
+            result = await page.evaluate(_FILL_AT, selector, value, origin)
+            return {**result, "field": field}
         return await self._with_page(work)
 
     async def click(self, selector) -> dict:

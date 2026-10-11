@@ -239,3 +239,158 @@ def test_a_timed_out_job_is_killed_in_the_image(container):
     result = tool(port, "shell", {"command": "sleep 300", "timeout": 1})
     assert result["timed_out"] is True
     assert docker("exec", name, "pgrep", "-x", "sleep", check=False).returncode != 0
+
+
+# -- Phase 3: secrets against the real container and Chromium -------------------
+
+P3_VALUE = "smoke-VARIABLE-7f3a9c"
+P3_PASSWORD = "smoke-PASSWORD-1b2d4e"
+P3_KEY = ("MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgRqWJh2dhYVVfPNQKF3jnILydYJT4"
+          "fTQhJFl8xUdt4OihRANCAAQ0s8ww5WFY0AgGCAdAkSDRbOrTchhs35kPKnw4Yu9pEkWgx1NxdJvhF6qP"
+          "oxMik67ig/aiCAiCSrQhog4v9wH0")
+P3_CRED = "Y3JlZGVudGlhbC1pZC0wMTIzNDU2Nzg5"
+
+P3_LOGIN_PAGE = """<!doctype html><title>login</title>
+<input id="pw" type="password">
+<p id="out">empty</p>
+<script>document.getElementById('pw').addEventListener('input', e =>
+  document.getElementById('out').textContent = 'len=' + e.target.value.length +
+  ' value=' + e.target.value)</script>"""
+
+P3_PASSKEY_PAGE = """<!doctype html><title>passkey</title><p id="out">pending</p>
+<script>
+const b = s => Uint8Array.from(atob(s), c => c.charCodeAt(0));
+navigator.credentials.get({publicKey: {challenge: new Uint8Array(32), rpId: 'localhost',
+  allowCredentials: [{type: 'public-key', id: b('%s')}], userVerification: 'preferred',
+  timeout: 20000}})
+  .then(c => document.getElementById('out').textContent = 'got ' + c.type + ' ' + c.id.length,
+        e => document.getElementById('out').textContent = 'error ' + e.name);
+</script>""" % P3_CRED
+
+P3_REGISTER_PAGE = """<!doctype html><title>register</title>
+<button id="go" onclick="go()">Register</button><p id="out">idle</p>
+<script>
+function go() {
+  document.getElementById('out').textContent = 'creating';
+  navigator.credentials.create({publicKey: {challenge: new Uint8Array(32),
+    rp: {id: 'localhost', name: 'Smoke Site'},
+    user: {id: new Uint8Array([1, 2, 3]), name: 'alice', displayName: 'Alice'},
+    pubKeyCredParams: [{type: 'public-key', alg: -7}],
+    authenticatorSelection: {residentKey: 'required', userVerification: 'preferred'}}})
+    .then(c => document.getElementById('out').textContent = 'created ' + c.type,
+          e => document.getElementById('out').textContent = 'error ' + e.name);
+}
+</script>"""
+
+
+def http_json(port, method, path, body=None):
+    import json
+
+    data = None if body is None else json.dumps(body).encode()
+    request = urllib.request.Request(
+        f"http://127.0.0.1:{port}{path}", data=data, method=method,
+        headers={"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            return response.status, json.loads(response.read() or b"null")
+    except urllib.error.HTTPError as exc:
+        return exc.code, json.loads(exc.read() or b"null")
+
+
+def page_text(port, selector="#out", until=lambda t: True, seconds=30):
+    deadline = time.time() + seconds
+    while True:
+        text = tool(port, "browser", {"action": "text", "selector": selector})["text"]
+        if until(text) or time.time() > deadline:
+            return text
+        time.sleep(0.3)
+
+
+def test_phase3_secrets_in_the_real_container(container):
+    import json
+
+    name, port = container
+    status, body = http_json(port, "PUT", "/secrets", {
+        "SMOKE_VAR": P3_VALUE,
+        "site": {"kind": "login", "sites": ["localhost"], "username": "alice",
+                 "password": P3_PASSWORD},
+        "pk": {"kind": "passkey", "rpId": "localhost", "credentialId": P3_CRED,
+               "privateKey": P3_KEY, "userHandle": "AQID"}})
+    assert status == 200 and body["variables"] == 1 and body["logins"] == 1
+    assert http_json(port, "GET", "/secrets")[0] in (404, 405)
+
+    # variable: present in the job, redacted from what comes back
+    result = mcp(port, "shell", {"command": 'test "$SMOKE_VAR" = ' + P3_VALUE +
+                                 ' && echo present; env | grep SMOKE_VAR'})
+    text = json.dumps(result)
+    assert "present" in text and "SMOKE_VAR=[REDACTED]" in text and P3_VALUE not in text
+    assert "LOOM_COMPUTER_TOKEN" not in tool(port, "shell", {"command": "env"})["stdout"]
+    # and not on disk
+    on_disk = docker("exec", name, "sh", "-c",
+                     f"grep -rl {P3_VALUE} /home/agent /tmp 2>/dev/null | wc -l").stdout.strip()
+    assert on_disk == "0"
+
+    for path, content in (("login.html", P3_LOGIN_PAGE), ("passkey.html", P3_PASSKEY_PAGE),
+                          ("register.html", P3_REGISTER_PAGE)):
+        tool(port, "files", {"action": "write", "path": f"site/{path}", "content": content})
+    tool(port, "shell", {"command": "setsid -f python3 -m http.server 8099 --bind 127.0.0.1 "
+                         "--directory /home/agent/workspace/site >/dev/null 2>&1 </dev/null"})
+    time.sleep(1)
+    wait_for_browser(port)
+
+    # login: typed on its own site, refused on another
+    tool(port, "browser", {"action": "navigate", "url": "http://localhost:8099/login.html"})
+    tool(port, "browser", {"action": "fill", "selector": "#pw", "secret": "site"})
+    typed = tool(port, "browser", {"action": "text", "selector": "#out"})["text"]
+    assert typed == f"len={len(P3_PASSWORD)} value=[REDACTED]"
+    tool(port, "browser", {"action": "navigate", "url": "http://127.0.0.1:8099/login.html"})
+    refused = mcp(port, "browser", {"action": "fill", "selector": "#pw", "secret": "site"})
+    assert refused["isError"] is True and "nothing was typed" in refused["content"][0]["text"]
+    assert P3_PASSWORD not in json.dumps(refused)
+    assert tool(port, "browser", {"action": "text", "selector": "#out"})["text"] == "empty"
+
+    # passkey: the site's get() is answered by the virtual authenticator
+    tool(port, "browser", {"action": "navigate", "url": "http://localhost:8099/passkey.html"})
+    assert page_text(port, until=lambda t: t != "pending").startswith("got public-key")
+
+    # registration: unarmed create() is refused, armed it is parked and asked
+    tool(port, "browser", {"action": "navigate", "url": "http://localhost:8099/register.html"})
+    tool(port, "browser", {"action": "click", "selector": "#go"})
+    assert page_text(port, until=lambda t: t != "creating") == "error NotAllowedError"
+    assert http_json(port, "GET", "/passkeys/registration")[1] == {"status": "idle"}
+
+    assert http_json(port, "PUT", "/passkeys/registration", {"rpId": "localhost"})[0] == 200
+    tool(port, "browser", {"action": "navigate", "url": "http://localhost:8099/register.html"})
+    tool(port, "browser", {"action": "click", "selector": "#go"})
+    deadline = time.time() + 20
+    while True:
+        got = http_json(port, "GET", "/passkeys/registration")[1]
+        if got["status"] == "asked" or time.time() > deadline:
+            break
+        time.sleep(0.3)
+    assert got["status"] == "asked", got
+    assert got["ask"]["rpId"] == "localhost" and got["ask"]["rpName"] == "Smoke Site"
+    assert got["ask"]["userName"] == "alice" and got["ask"]["origin"] == "http://localhost:8099"
+    assert page_text(port) == "creating"  # parked: the site is still waiting
+    assert http_json(port, "POST", "/passkeys/registration/answer",
+                     {"id": got["ask"]["id"], "approved": True})[0] == 200
+    assert page_text(port, until=lambda t: t != "creating") == "created public-key"
+    deadline = time.time() + 20
+    while True:
+        got = http_json(port, "GET", "/passkeys/registration")[1]
+        if got["status"] == "registered" or time.time() > deadline:
+            break
+        time.sleep(0.3)
+    assert got["status"] == "registered" and got["passkey"]["kind"] == "passkey"
+    assert got["passkey"]["rpId"] == "localhost" and got["passkey"]["privateKey"]
+    # the minted key is masked from tool output from now on
+    leak = tool(port, "shell", {"command": "echo " + got["passkey"]["privateKey"]})
+    assert got["passkey"]["privateKey"] not in json.dumps(leak)
+    assert http_json(port, "DELETE", "/passkeys/registration")[0] == 200
+    assert http_json(port, "POST", "/passkeys/registration/answer",
+                     {"id": "x", "approved": True})[0] == 409
+
+    # the whole container logged none of it
+    logs = docker("logs", name)
+    for secret in (P3_VALUE, P3_PASSWORD, P3_KEY, got["passkey"]["privateKey"]):
+        assert secret not in logs.stdout + logs.stderr
