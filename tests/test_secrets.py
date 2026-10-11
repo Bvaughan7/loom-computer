@@ -340,6 +340,33 @@ def test_base64_read_with_short_value_stays_valid_base64(client, workspace):
     assert b"D" not in raw.replace(b"[REDACTED]", b"")
 
 
+def test_base64_and_utf8_reads_mask_a_secret_in_the_path(client, workspace):
+    put_secrets(client, {"MY_TOKEN": VAR_VALUE})
+    (workspace / VAR_VALUE).write_bytes(b"plain")
+    for encoding in ("base64", "utf-8"):
+        out = call(client, "files", {"action": "read", "path": VAR_VALUE,
+                                     "encoding": encoding})
+        assert VAR_VALUE not in json.dumps(out)
+        assert answer(out)["path"] == "[REDACTED]"
+
+
+@pytest.mark.parametrize("body", [
+    {"BAD": "A[REDACTED]Z"},
+    {"BAD": {"kind": "login", "sites": ["a.com"], "username": "u[REDACTED]",
+             "password": "p"}},
+    {"BAD": {"kind": "login", "sites": ["a.com"], "username": "u",
+             "password": "p[REDACTED]"}},
+])
+def test_a_value_holding_the_mask_token_is_400_naming_the_secret(client, body):
+    put_secrets(client, {"KEEP": VAR_VALUE})
+    r = put_secrets(client, body)
+    assert r.status_code == 400
+    assert "BAD" in r.json()["error"] and "A[REDACTED]Z" not in r.text
+    out = answer(call(client, "shell", {"command": "echo -n $KEEP"}))
+    assert out["stdout"] == "[REDACTED]"  # the old set stands
+    assert put_secrets(client, {"V": VAR_VALUE}).status_code == 200
+
+
 def test_malformed_set_errors_name_the_secret(client):
     bad_site = {"kind": "login", "sites": ["not a host!"], "username": "u", "password": "p"}
     r = put_secrets(client, {"SITEY": bad_site})

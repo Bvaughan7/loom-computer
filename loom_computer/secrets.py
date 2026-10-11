@@ -130,6 +130,14 @@ def _shown(name: str) -> str:
     return re.sub(r"[^\x20-\x7e]", "?", name)[:64]
 
 
+def _no_mask_token(name: str, value: str) -> None:
+    # A value holding the mask could be re-spelled by masking a shorter one
+    # around it ("x" in "AxZ" -> "A[REDACTED]Z").
+    if REDACTED in value:
+        raise SecretsError(
+            f"secret {_shown(name)}: value must not contain the literal {REDACTED}")
+
+
 class SecretStore:
     """The set, and everything derived from it. Replaced whole, atomically."""
 
@@ -162,6 +170,7 @@ class SecretStore:
                 if "\0" in value:  # an environment cannot hold a NUL
                     raise SecretsError(
                         f"secret {_shown(name)}: value must not contain a NUL character")
+                _no_mask_token(name, value)
                 variables[name] = value
             elif isinstance(value, dict):
                 kind = value.get("kind")
@@ -197,6 +206,9 @@ class SecretStore:
                 totp_code(totp, 0)
             except ToolError:
                 raise SecretsError(f"secret {_shown(name)}: totp is not valid base32") from None
+        for granted in (username, password, totp):
+            if granted is not None:
+                _no_mask_token(name, granted)
         return Login(name, tuple(s.strip() for s in sites), username, password, totp)
 
     def on_change(self, listener) -> None:

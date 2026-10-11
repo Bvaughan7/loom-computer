@@ -235,6 +235,7 @@ class Tools:
                 # text redactor knows
                 data = self.secrets.redact_bytes(base64.b64decode(got["content"]))
                 got = {**got, "bytes": len(data),
+                       "path": self.secrets.redact(got["path"]),
                        "content": base64.b64encode(data).decode("ascii")}
                 # byte-level masking is complete for this content; the text
                 # redactor is skipped so the base64 stays valid
