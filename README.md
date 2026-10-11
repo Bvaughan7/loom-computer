@@ -101,13 +101,15 @@ Design:
   `files read` with `encoding: base64` masks values at the byte level before
   encoding. The text redactor is skipped for the encoded content only, to
   keep the base64 valid; the `path` is masked as usual. The `[REDACTED]`
-  token is atomic and public, so the guarantee is about recovery, not
-  byte-substrings: masked output never lets the agent recover a granted
-  value. A short value's characters may coincide with the token's own text
-  (any one-character value occurs inside every token) or with a substring
-  of the base64 text, but neither coincidence reveals the value — what the
-  token replaced stays hidden. A granted value must not contain the literal
-  `[REDACTED]`; such a set is rejected at PUT.
+  token is atomic and public: masked output never contains a granted value
+  in recoverable form — a value's characters may coincide with the token's
+  own text or with a substring of the base64 text, but neither coincidence
+  reveals the value. Deliberate probing is a separate matter: an agent that
+  writes a guessed value and reads it back can tell whether the guess
+  matched a granted value (it comes back masked). That confirmation oracle
+  is inherent to any output masking; this design's boundary is accidental
+  exposure, not a malicious agent. A granted value must not contain the
+  literal `[REDACTED]`; such a set is rejected at PUT.
 - **Logins.** `browser fill {selector, secret, field?}`; the page origin is
   read and checked against `sites` and the typing happens in the same page
   evaluation guarded by that origin, so a navigation cannot slip between. A
