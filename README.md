@@ -5,7 +5,7 @@ Linux desktop that a teammate drives through one MCP server. It is local
 infrastructure, not a special agent type. Loom grants the machine's `/mcp`
 endpoint to a teammate like any other server, and the person sees and drives
 the same desktop through the viewer the machine serves. The image releases on
-its own schedule; this skeleton is release line **0.10.3**, Loom's
+its own schedule; this skeleton is release line **0.10.3** (the `VERSION` file), Loom's
 `COMPUTER_VERSION` floor.
 
 ## Contract summary
@@ -116,6 +116,77 @@ Design:
   site entry covers its host and hosts within it; a bare host means https
   (plain http only for `localhost`/`127.0.0.1`); an entry with a scheme or
   port must match those too.
+## Releasing
+
+`VERSION` (repo root, plain `X.Y.Z`) is the single source of truth.
+`loom_computer.VERSION` reads it (so `/health`, the MCP `serverInfo` and
+`state action=guide` serve it), the Dockerfile copies it into the image and
+takes it as `--build-arg VERSION` for the `org.opencontainers.image.version`
+label (the build fails if the arg and the file disagree), and the workflow
+reads it for the build arg and refuses a tag that does not match it.
+
+### Process
+
+1. `./scripts/release.sh <version>`: validates semver, requires a clean tree
+   and an unused tag, writes `VERSION`, commits `release: <version>`, tags
+   `v<version>` and pushes the tag (it asks first; `--yes` skips that). If
+   `VERSION` already holds the version, no commit is made and the tag lands
+   on HEAD.
+2. The tag push triggers `.github/workflows/release.yml`: it checks tag ==
+   `VERSION`, builds the image, smoke-checks that the built image's guide
+   serves that version, pushes
+   `ghcr.io/bvaughan7/loom-computer:<version>` with `GITHUB_TOKEN`
+   (`contents: write` for the release, `packages: write`), and creates the
+   GitHub release `v<version>` whose notes carry the image reference and the
+   pushed digest (and a `@sha256:` pinned form).
+3. The desk discovers it: `releases.rs` lists the repo's releases and parses
+   `tag_name`; the desk derives the image as
+   `ghcr.io/bvaughan7/loom-computer:<tag without v>`, and learns the running
+   release from `guide.version`.
+
+Dry runs push nothing: `./scripts/release.sh --dry-run [<version>]` builds the
+image locally as `ghcr.io/bvaughan7/loom-computer:<version>` (from a copy of
+the tree, so it works before `VERSION` is bumped and changes no git state),
+starts it and checks the guide serves `<version>`. In CI, `workflow_dispatch`
+with an `image_tag` does the same build and smoke check and stops before
+login, push and release.
+
+### `latest` is not tagged
+
+Only `:<version>` is pushed. The desk never uses `latest` (it resolves a
+concrete release and a pinned image is used as written), so the tag would be
+read by nobody, and a moving tag on a private package makes "what is
+running" ambiguous. Add it later only if a consumer needs it.
+
+### Auth while the package is private
+
+The repository and package are private. Pulling needs `docker login ghcr.io`
+with a classic PAT that has `read:packages` (`write:packages` to push by
+hand; CI uses `GITHUB_TOKEN`, no PAT). While private, the desk host must be
+logged in and the desk should use pinned image references
+(`ghcr.io/bvaughan7/loom-computer:0.10.3`, as in its pin setting): the
+unauthenticated GitHub releases listing cannot see a private repo's
+releases, so "Newest" discovery works only once the repo is public or the
+desk is given a token, and the floor/pins work regardless.
+
+### First real release (v0.10.3), what Bryan does
+
+`VERSION` already says 0.10.3 and no tag exists, so nothing needs bumping.
+
+1. Merge this branch (`phase4/release-pipeline`) to the main branch.
+2. In the repo's Settings > Actions > General, give workflows read and write
+   permissions (or leave the default and rely on the workflow's own
+   `permissions:` block, which is sufficient).
+3. Optionally rehearse: Actions > release > Run workflow (`image_tag`
+   `dryrun`), and/or `./scripts/release.sh --dry-run`.
+4. `./scripts/release.sh 0.10.3`. Watch the run (`gh run list --workflow
+   release.yml`).
+5. After the first push, GHCR creates the package private and linked to the
+   repo; check Packages > loom-computer > Package settings (visibility,
+   and that the repo has Actions write access to it).
+6. On the desk host: `docker login ghcr.io` (PAT with `read:packages`), then
+   `docker pull ghcr.io/bvaughan7/loom-computer:0.10.3`.
+
 ## Held for redesign
 
 All passkey code is held, and none ships in this release: no registration
