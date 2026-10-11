@@ -25,7 +25,7 @@ html, body { margin: 0; height: 100%; background: #111; overflow: hidden; }
   var statusEl = document.getElementById("status");
   // The token rides in the URL fragment, so it is never part of a request line.
   var token = decodeURIComponent(location.hash.replace(/^#/, ""));
-  var socket = null, retry = 500, buttons = 0, drawing = false, pending = null;
+  var socket = null, retry = 500, buttons = 0, lastX = 0, lastY = 0, drawing = false, pending = null;
 
   function say(text) { statusEl.textContent = text; }
 
@@ -76,7 +76,7 @@ html, body { margin: 0; height: 100%; background: #111; overflow: hidden; }
 
   function pointer(event) {
     var p = point(event);
-    buttons = event.buttons;
+    buttons = event.buttons; lastX = p.x; lastY = p.y;
     send({ t: "pointer", x: p.x, y: p.y, buttons: buttons });
   }
 
@@ -91,15 +91,45 @@ html, body { margin: 0; height: 100%; background: #111; overflow: hidden; }
     send({ t: "wheel", dy: Math.sign(event.deltaY) });
   }, { passive: false });
 
-  function key(down) {
-    return function (event) {
-      if (event.metaKey && event.key !== "Meta") return; // leave browser shortcuts alone
-      event.preventDefault();
-      send({ t: "key", key: event.key, down: down });
-    };
+  // Keys the host currently believes are down, so every one gets a release
+  // even when focus or a Meta shortcut swallows the matching keyup.
+  var held = {};
+
+  function releaseKey(name) {
+    if (!held[name]) return;
+    delete held[name];
+    send({ t: "key", key: name, down: false });
   }
-  canvas.addEventListener("keydown", key(true));
-  canvas.addEventListener("keyup", key(false));
+
+  function releaseAll() {
+    Object.keys(held).forEach(releaseKey);
+    if (buttons) {
+      buttons = 0;
+      send({ t: "pointer", x: lastX, y: lastY, buttons: 0 });
+    }
+  }
+
+  canvas.addEventListener("keydown", function (event) {
+    if (event.metaKey && event.key !== "Meta") return; // leave browser shortcuts alone
+    event.preventDefault();
+    held[event.key] = true;
+    send({ t: "key", key: event.key, down: true });
+  });
+  canvas.addEventListener("keyup", function (event) {
+    // Never suppressed: a release must get through even mid-shortcut.
+    if (held[event.key] || !event.metaKey) event.preventDefault();
+    releaseKey(event.key);
+    // Browsers drop the keyups of keys pressed under Meta, so letting go of
+    // Meta lets go of everything.
+    if (event.key === "Meta") Object.keys(held).forEach(releaseKey);
+  });
+  canvas.addEventListener("blur", releaseAll);
+  window.addEventListener("blur", releaseAll);
+  document.addEventListener("visibilitychange", function () {
+    if (document.hidden) releaseAll();
+  });
+  canvas.addEventListener("pointercancel", pointer);
+  canvas.addEventListener("lostpointercapture", pointer);
 
   connect();
 })();
