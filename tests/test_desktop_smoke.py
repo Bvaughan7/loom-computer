@@ -35,26 +35,6 @@ def paint(display_name, rgb):
     return d  # keep the connection open: the window lives as long as it
 
 
-@pytest.fixture
-def display():
-    number = 90 + os.getpid() % 500
-    name = f":{number}"
-    proc = subprocess.Popen(
-        ["Xvfb", name, "-screen", "0", "800x600x24", "-nolisten", "tcp"],
-        stderr=subprocess.DEVNULL)
-    socket = f"/tmp/.X11-unix/X{number}"
-    for _ in range(100):
-        if os.path.exists(socket):
-            break
-        time.sleep(0.05)
-    else:
-        proc.kill()
-        pytest.skip("Xvfb did not come up")
-    yield name
-    proc.terminate()
-    proc.wait(5)
-
-
 def test_frame_flows_end_to_end(display):
     from PIL import Image
 

@@ -2,6 +2,7 @@
 
 import asyncio
 import base64
+import contextlib
 import copy
 import hashlib
 import hmac
@@ -10,16 +11,22 @@ import logging
 import os
 import re
 import sys
+import threading
+import weakref
 from importlib import resources
 
 from fastapi import FastAPI, Request, WebSocket
 from starlette.websockets import WebSocketDisconnect
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 from . import VERSION
+from .browser import Browser
 from .desktop import Desktop, FrameHub, InputSession
+from .errors import ToolError
+from .tools import DEFINITIONS, Tools
 
 PORT = 8787
+WORKSPACE = "/home/agent/workspace"
 SKILL_NAME = "loom-computer"
 log = logging.getLogger("loom_computer")
 
@@ -37,6 +44,47 @@ def _viewer_page() -> tuple[str, str]:
            f"script-src {digest('script')}; style-src {digest('style')}; "
            "base-uri 'none'; form-action 'none'")
     return html, csp
+
+
+def _download_error(status: int, message: str) -> JSONResponse:
+    # `error` is the human-facing reason the desk shows; `code` is the
+    # machine-readable class.
+    return JSONResponse({"error": message, "code": "download_failed"},
+                        status_code=status)
+
+
+class _OwnedFd:
+    """A descriptor with exactly one closer, safe against a read in flight."""
+
+    def __init__(self, fd: int):
+        self._fd: int | None = fd
+        self._lock = threading.Lock()
+
+    def read(self, n: int) -> bytes:
+        with self._lock:
+            return os.read(self._fd, n) if self._fd is not None else b""
+
+    def close(self) -> None:
+        with self._lock:
+            if self._fd is not None:
+                fd, self._fd = self._fd, None
+                os.close(fd)
+
+
+class _FdResponse(StreamingResponse):
+    """Closes its descriptor when the response ends, is cancelled, or is
+    dropped without ever being sent."""
+
+    def __init__(self, owned: _OwnedFd, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._finalizer = weakref.finalize(self, owned.close)
+        self._owned = owned
+
+    async def __call__(self, scope, receive, send):
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            self._owned.close()
 
 
 def _skill_document() -> str:
@@ -69,26 +117,11 @@ def _rpc_error(rpc_id, code: int, message: str) -> dict:
 INVALID_REQUEST = -32600
 
 
-def _not_implemented(rpc_id) -> dict:
-    return _rpc_error(rpc_id, -32601, "not implemented")
-
-
 def _invalid(rpc_id, why: str) -> dict:
     return _rpc_error(rpc_id, INVALID_REQUEST, f"invalid request: {why}")
 
 
-STATE_TOOL = {
-    "name": "state",
-    "description": "Computer state and the release guide.",
-    "inputSchema": {
-        "type": "object",
-        "properties": {"action": {"type": "string", "enum": ["guide"]}},
-        "required": ["action"],
-    },
-}
-
-
-def _handle_rpc(message: dict) -> dict | None:
+async def _handle_rpc(message: dict, tools: Tools) -> dict | None:
     """Answer one JSON-RPC message; None for a notification (no `id` member)."""
     has_id = "id" in message
     rpc_id = message.get("id")
@@ -117,30 +150,40 @@ def _handle_rpc(message: dict) -> dict | None:
             "serverInfo": {"name": SKILL_NAME, "version": VERSION},
         })
     if method == "tools/list":
-        return _rpc_result(rpc_id, {"tools": [STATE_TOOL]})
+        return _rpc_result(rpc_id, {"tools": DEFINITIONS})
     if method == "tools/call":
         args = params.get("arguments")
         if args is None:
             args = {}
         if not isinstance(args, dict):
             return _invalid(rpc_id, "arguments must be an object")
-        if params.get("name") == "state" and args.get("action") == "guide":
-            body = guide()
-            return _rpc_result(rpc_id, {
-                "content": [{"type": "text", "text": json.dumps(body)}],
-                "structuredContent": body,
-                "isError": False,
-            })
-    return _not_implemented(rpc_id)
+        name = params.get("name")
+        if not isinstance(name, str):
+            return _invalid(rpc_id, "name must be a string")
+        if not tools.has(name):
+            return _rpc_error(rpc_id, -32602, "unknown tool")
+        return _rpc_result(rpc_id, await tools.call(name, args))
+    return _rpc_error(rpc_id, -32601, "method not found")
 
 
-def create_app(token: str, desktop: Desktop | None = None) -> FastAPI:
+def create_app(token: str, desktop: Desktop | None = None,
+               workspace: str | None = None,
+               browser: Browser | None = None) -> FastAPI:
     if not token:
         raise ValueError("LOOM_COMPUTER_TOKEN must be a non-empty token")
-    app = FastAPI(title="Loom Computer", version=VERSION,
+    desktop = desktop or Desktop()
+    tools = Tools(guide, desktop,
+                  workspace or os.environ.get("LOOM_WORKSPACE", WORKSPACE), browser)
+
+    @contextlib.asynccontextmanager
+    async def lifespan(_app):
+        yield
+        tools.shutdown()  # no job outlives the API
+
+    app = FastAPI(title="Loom Computer", version=VERSION, lifespan=lifespan,
                   docs_url=None, redoc_url=None, openapi_url=None)
 
-    hub = FrameHub(desktop or Desktop())
+    hub = FrameHub(desktop)
     viewer_html, viewer_csp = _viewer_page()
 
     def token_ok(candidate: str | None) -> bool:
@@ -171,7 +214,7 @@ def create_app(token: str, desktop: Desktop | None = None) -> FastAPI:
 
     @app.post("/mcp")
     async def mcp(request: Request):
-        # Phase 0: the holder is recognized and logged, nothing more.
+        # The holder is recognized and logged, nothing more.
         log.debug("mcp request holder=%s", request.headers.get("x-computer-holder"))
         try:
             message = await request.json()
@@ -181,11 +224,47 @@ def create_app(token: str, desktop: Desktop | None = None) -> FastAPI:
             return JSONResponse(
                 _rpc_error(None, -32600, "invalid request: object required"),
                 status_code=400)
-        response = _handle_rpc(message)
+        response = await _handle_rpc(message, tools)
         if response is None:
             return JSONResponse(None, status_code=202)
         invalid = response.get("error", {}).get("code") == INVALID_REQUEST
         return JSONResponse(response, status_code=400 if invalid else 200)
+
+    @app.get("/files/download")
+    async def download(path: str = "", max_bytes: str | None = None):
+        """Raw bytes of one workspace file, for the desk. Same confinement
+        as the `files` tool; `max_bytes` cuts the body short."""
+        limit = None
+        if max_bytes is not None:
+            if not max_bytes.isascii() or not max_bytes.isdigit():
+                return _download_error(400, "max_bytes must be a non-negative integer")
+            limit = int(max_bytes)
+        try:
+            fd, size, _ = await tools.workspace.open_regular_async(path)
+        except ToolError as exc:
+            text = str(exc)
+            if text == "no such file":
+                return _download_error(404, "no such file")
+            if "outside the workspace" in text:
+                return _download_error(403, text)
+            return _download_error(400, text)
+        length = size if limit is None else min(size, limit)
+
+        owned = _OwnedFd(fd)
+
+        async def body():
+            left = length
+            while left > 0:
+                chunk = await asyncio.to_thread(owned.read, min(65536, left))
+                if not chunk:
+                    break
+                left -= len(chunk)
+                yield chunk
+
+        return _FdResponse(owned, body(), media_type="application/octet-stream", headers={
+            "Content-Length": str(length), "Cache-Control": "no-store",
+            "X-Content-Type-Options": "nosniff",
+            "X-Loom-Truncated": "true" if length < size else "false"})
 
     @app.get("/", response_class=HTMLResponse)
     async def viewer():
