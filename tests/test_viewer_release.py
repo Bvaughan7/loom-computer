@@ -69,3 +69,17 @@ def test_meta_release_lets_go_of_keys_whose_keyup_was_dropped():
 
 def test_unheld_release_sends_nothing():
     assert run("key('keyup', 'z', true);") == []
+
+
+@pytest.mark.parametrize("event", ["pointercancel", "lostpointercapture"])
+def test_pointer_cancel_releases_all_buttons_not_event_buttons(event):
+    # The cancelled event still claims buttons: 1; it must not be forwarded.
+    sent = run(f"""
+      handlers['canvas:pointerdown']({{ clientX: 5, clientY: 6, buttons: 1, pointerId: 1 }});
+      handlers['canvas:{event}']({{ clientX: 9, clientY: 9, buttons: 1, pointerId: 1 }});
+    """)
+    assert sent == [("pointer", None, None, 1), ("pointer", None, None, 0)]
+
+
+def test_pointer_cancel_with_nothing_held_sends_nothing():
+    assert run("handlers['canvas:pointercancel']({ buttons: 1, pointerId: 1 });") == []
