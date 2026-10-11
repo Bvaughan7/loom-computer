@@ -15,11 +15,12 @@ from importlib import resources
 
 from fastapi import FastAPI, Request, WebSocket
 from starlette.websockets import WebSocketDisconnect
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 from . import VERSION
 from .browser import Browser
 from .desktop import Desktop, FrameHub, InputSession
+from .errors import ToolError
 from .tools import DEFINITIONS, Tools
 
 PORT = 8787
@@ -41,6 +42,11 @@ def _viewer_page() -> tuple[str, str]:
            f"script-src {digest('script')}; style-src {digest('style')}; "
            "base-uri 'none'; form-action 'none'")
     return html, csp
+
+
+def _download_error(status: int, message: str) -> JSONResponse:
+    return JSONResponse({"error": "download_failed", "message": message},
+                        status_code=status)
 
 
 def _skill_document() -> str:
@@ -185,6 +191,41 @@ def create_app(token: str, desktop: Desktop | None = None,
             return JSONResponse(None, status_code=202)
         invalid = response.get("error", {}).get("code") == INVALID_REQUEST
         return JSONResponse(response, status_code=400 if invalid else 200)
+
+    @app.get("/files/download")
+    async def download(path: str = "", max_bytes: str | None = None):
+        """Raw bytes of one workspace file, for the desk. Same confinement
+        as the `files` tool; `max_bytes` cuts the body short."""
+        limit = None
+        if max_bytes is not None:
+            if not max_bytes.isascii() or not max_bytes.isdigit():
+                return _download_error(400, "max_bytes must be a non-negative integer")
+            limit = int(max_bytes)
+        try:
+            fd, size, _ = await asyncio.to_thread(tools.workspace.open_regular, path)
+        except ToolError as exc:
+            text = str(exc)
+            if text == "no such file":
+                return _download_error(404, "no such file")
+            if "outside the workspace" in text:
+                return _download_error(403, text)
+            return _download_error(400, text)
+        length = size if limit is None else min(size, limit)
+
+        async def body():
+            left = length
+            with os.fdopen(fd, "rb") as handle:
+                while left > 0:
+                    chunk = await asyncio.to_thread(handle.read, min(65536, left))
+                    if not chunk:
+                        break
+                    left -= len(chunk)
+                    yield chunk
+
+        return StreamingResponse(body(), media_type="application/octet-stream", headers={
+            "Content-Length": str(length), "Cache-Control": "no-store",
+            "X-Content-Type-Options": "nosniff",
+            "X-Loom-Truncated": "true" if length < size else "false"})
 
     @app.get("/", response_class=HTMLResponse)
     async def viewer():

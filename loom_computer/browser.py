@@ -1,9 +1,10 @@
 """The real Chromium of the desktop, driven over the Chrome DevTools Protocol.
 
 Chromium is started by supervisord with a debugging port on loopback. Each
-call opens a socket to the page target that was most recently active, does its
-work, and closes: nothing is cached, so a tab the person opened or closed in
-the viewer is simply what the next call finds.
+call finds the active tab (the page that reports itself focused, else
+visible, over CDP), opens a socket to it, does its work, and closes: nothing
+is cached, so a tab the person opened, closed or switched to in the viewer is
+simply what the next call finds.
 """
 
 import asyncio
@@ -18,6 +19,9 @@ NAVIGATE_TIMEOUT = 30.0
 CALL_TIMEOUT = 15.0
 MAX_TEXT = 100_000
 MAX_TREE_LINES = 2000
+MAX_TREE_BYTES = 200_000
+MAX_TREE_FIELD = 500  # characters of one node name or value
+MAX_PAGES_PROBED = 16
 SCHEMES = ("http:", "https:", "file:", "about:", "data:")
 
 _FILL = """(selector, value) => {
@@ -54,7 +58,7 @@ _CENTER = """(selector) => {
 _TEXT = """(selector) => {
   const el = selector === null ? document.body : document.querySelector(selector);
   if (!el) return {error: 'no element matches the selector'};
-  return {text: el.innerText};
+  return {text: el.innerText ?? el.textContent ?? ''};
 }"""
 
 
@@ -121,7 +125,7 @@ class Browser:
         self.endpoint = endpoint or os.environ.get("LOOM_CDP_ENDPOINT", DEFAULT_ENDPOINT)
         self._lock = asyncio.Lock()
 
-    async def _target(self) -> str:
+    async def _pages(self) -> list[dict]:
         try:
             raw = await asyncio.to_thread(_fetch, f"{self.endpoint}/json/list")
             pages = [t for t in json.loads(raw)
@@ -134,6 +138,34 @@ class Browser:
         except (OSError, ValueError):
             raise ToolError("cannot reach Chromium; the desktop may still "
                             "be starting, try again shortly") from None
+        return pages
+
+    async def _probe(self, page: dict) -> int:
+        """2 when the page has focus, 1 when merely visible, else 0."""
+        from websockets.asyncio.client import connect
+
+        try:
+            async with connect(page["webSocketDebuggerUrl"], max_size=1024 * 1024,
+                               open_timeout=2, ping_interval=None,
+                               compression=None) as socket:
+                session = _Session(socket)
+                state = await session.evaluate(
+                    "() => [document.visibilityState, document.hasFocus()]")
+        except Exception:  # noqa: BLE001 - an unprobeable tab is just not preferred
+            return 0
+        if not isinstance(state, list) or len(state) != 2 or state[0] != "visible":
+            return 0
+        return 2 if state[1] else 1
+
+    async def _target(self) -> str:
+        """The active tab's debugger URL; the first page if none can say."""
+        pages = await self._pages()
+        if len(pages) > 1:
+            probed = pages[:MAX_PAGES_PROBED]
+            ranks = await asyncio.gather(*(self._probe(p) for p in probed))
+            best = max(range(len(probed)), key=lambda i: (ranks[i], -i))
+            if ranks[best] > 0:
+                return probed[best]["webSocketDebuggerUrl"]
         return pages[0]["webSocketDebuggerUrl"]
 
     async def _with_page(self, work):
@@ -179,7 +211,8 @@ class Browser:
 
         async def work(page: _Session):
             value = await page.evaluate(_TEXT, selector)
-            text = value["text"]
+            text = value.get("text") if isinstance(value, dict) else None
+            text = text if isinstance(text, str) else ""
             return {"text": text[:MAX_TEXT], "truncated": len(text) > MAX_TEXT}
         return await self._with_page(work)
 
@@ -227,7 +260,9 @@ def _check_selector(selector, required: bool = True) -> None:
 
 def render_tree(title: str, url: str, nodes: list[dict]) -> str:
     by_id = {n["nodeId"]: n for n in nodes}
-    lines = [f"# {title} - {url}"]
+    lines = [f"# {_clip(title)} - {_clip(url)}"]
+    used = len(lines[0]) + 1
+    stop = [False]
     skipped_roles = {"InlineTextBox", "none", "generic", "presentation"}
 
     def value(field):
@@ -235,24 +270,35 @@ def render_tree(title: str, url: str, nodes: list[dict]) -> str:
 
     def walk(node_id: str, depth: int, parent_name: str) -> None:
         node = by_id.get(node_id)
-        if node is None or len(lines) > MAX_TREE_LINES:
+        if node is None or stop[0]:
             return
-        role, name = value(node.get("role")), str(value(node.get("name")))
+        role, name = str(value(node.get("role"))), str(value(node.get("name")))
         show = (not node.get("ignored") and role not in skipped_roles
                 and not (role == "StaticText" and name in parent_name))
         if show:
             line = "  " * depth + role
             if name:
-                line += " " + json.dumps(name)
+                line += " " + json.dumps(_clip(name))
             extra = value(node.get("value"))
             if extra != "":
-                line += " value=" + json.dumps(str(extra))
+                line += " value=" + json.dumps(_clip(str(extra)))
+            nonlocal used
+            if len(lines) > MAX_TREE_LINES or used + len(line) + 1 > MAX_TREE_BYTES:
+                stop[0] = True
+                return
             lines.append(line)
+            used += len(line.encode("utf-8")) + 1
         for child in node.get("childIds", []):
             walk(child, depth + 1 if show else depth, name or parent_name)
 
     if nodes:
         walk(nodes[0]["nodeId"], 0, "")
-    if len(lines) > MAX_TREE_LINES:
-        lines = lines[:MAX_TREE_LINES] + [f"[... tree cut at {MAX_TREE_LINES} lines ...]"]
+    if stop[0]:
+        lines.append(f"[... tree cut at {MAX_TREE_LINES} lines / {MAX_TREE_BYTES} bytes ...]")
     return "\n".join(lines)
+
+
+def _clip(text: str) -> str:
+    if len(text) <= MAX_TREE_FIELD:
+        return text
+    return text[:MAX_TREE_FIELD] + "..."

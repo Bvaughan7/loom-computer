@@ -127,14 +127,14 @@ class Jobs:
         self._live: set[int] = set()  # process group ids
 
     async def run(self, argv: list[str], cwd: str, env: dict[str, str],
-                  timeout: float) -> JobResult:
+                  timeout: float, pass_fds: tuple[int, ...] = ()) -> JobResult:
         loop = asyncio.get_running_loop()
         started = loop.time()
         try:
             proc = await asyncio.create_subprocess_exec(
                 *argv, cwd=cwd, env=env, stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-                start_new_session=True)
+                start_new_session=True, pass_fds=pass_fds)
         except FileNotFoundError:
             raise ToolError(f"cannot run {argv[0]!r}: no such file or command") from None
         except PermissionError:

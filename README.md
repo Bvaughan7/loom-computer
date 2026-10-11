@@ -28,7 +28,7 @@ Nothing runs as root: the image uses the `agent` user (UID 1000) with
 `/home/agent/workspace` as its working directory.
 
 Not yet implemented: `PUT /secrets`, `/passkeys/registration`,
-`DELETE /logins/{name}`, `state login_load`, `GET /files/download`.
+`DELETE /logins/{name}`, `state login_load`.
 
 ## The tools (Phase 2)
 

@@ -8,14 +8,18 @@ exited non-zero is a result, not an error: the exit code is in it.
 import asyncio
 import base64
 import json
+import logging
 import os
 import re
+import stat
 
 from .browser import Browser
 from .desktop import Desktop
 from .errors import ToolError
 from .jobs import Jobs, base_env, clamp_timeout, workspace_env
 from .workspace import Workspace
+
+log = logging.getLogger("loom_computer")
 
 MAX_IMAGE_EDGE = 1568
 CAPTURE_MODES = ("image", "png", "tree")
@@ -134,6 +138,9 @@ class Tools:
             return await handler(args)
         except ToolError as exc:
             return _error(f"{name}: {exc}")
+        except Exception as exc:  # noqa: BLE001 - a tool bug is an answer, not a 500
+            log.exception("tool %s failed", name)
+            return _error(f"{name}: unexpected {type(exc).__name__}; the call was not completed")
 
     # -- state ----------------------------------------------------------------
 
@@ -161,10 +168,11 @@ class Tools:
             raise ToolError("cwd is not a directory")
         return os.path.realpath(path)
 
-    async def _run_job(self, argv: list[str], args: dict) -> dict:
+    async def _run_job(self, argv: list[str], args: dict,
+                       pass_fds: tuple[int, ...] = ()) -> dict:
         timeout = clamp_timeout(args.get("timeout"))
         result = await self.jobs.run(argv, self._cwd(args.get("cwd")),
-                                     self._job_env(), timeout)
+                                     self._job_env(), timeout, pass_fds)
         return text_result(result.as_dict())
 
     async def _shell(self, args: dict) -> dict:
@@ -206,21 +214,25 @@ class Tools:
         raise ToolError(f"unknown action {shown} (one of: read, write, list, run)")
 
     async def _files_run(self, path, args: dict) -> dict:
-        real = self.workspace.resolve(path)
-        if not os.path.isfile(real):
-            raise ToolError("no such file")
-        script_args = args.get("args", [])
-        if not isinstance(script_args, list) or not all(isinstance(a, str) for a in script_args):
-            raise ToolError("args must be a list of strings")
-        interpreter = INTERPRETERS.get(os.path.splitext(real)[1].lower())
-        if interpreter is not None:
-            argv = [interpreter, real, *script_args]
-        elif os.access(real, os.X_OK):
-            argv = [real, *script_args]
-        else:
-            raise ToolError("file is not executable and has no known script "
-                            "extension (.py, .sh); chmod +x it or use shell")
-        return await self._run_job(argv, args)
+        # The script is opened once, without following links, and run from
+        # that descriptor: the file that was checked is the file that runs.
+        fd, _, rel = await _blocking(self.workspace.open_regular, path)
+        try:
+            script_args = args.get("args", [])
+            if not isinstance(script_args, list) or not all(isinstance(a, str) for a in script_args):
+                raise ToolError("args must be a list of strings")
+            via = f"/dev/fd/{fd}"
+            interpreter = INTERPRETERS.get(os.path.splitext(rel)[1].lower())
+            if interpreter is not None:
+                argv = [interpreter, via, *script_args]
+            elif os.fstat(fd).st_mode & stat.S_IXUSR:
+                argv = [via, *script_args]
+            else:
+                raise ToolError("file is not executable and has no known script "
+                                "extension (.py, .sh); chmod +x it or use shell")
+            return await self._run_job(argv, args, (fd,))
+        finally:
+            os.close(fd)
 
     # -- browser --------------------------------------------------------------
 
