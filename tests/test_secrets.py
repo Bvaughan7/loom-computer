@@ -10,6 +10,7 @@ import base64
 import json
 import logging
 import os
+import re
 import threading
 import time
 from http import HTTPStatus
@@ -47,6 +48,7 @@ class FakeCDP:
 
     def __init__(self, origins):
         self.origins = list(origins)  # one page origin per tab
+        self.pending = {}  # page-side id -> nonce of each create() the guard holds
         self.fills: list[str] = []  # expressions that typed something
         self.calls: list[tuple[int, str, dict]] = []
         self.credentials: dict[int, dict[str, dict]] = {}
@@ -126,7 +128,12 @@ class FakeCDP:
                 else:
                     self.fills.append(expression)
                     value = {"filled": "input"}
-            elif "__loomRelease" in expression:
+            elif expression.startswith("window.__loomParked &&"):
+                # the page guard's own pending map: only real creates are in it
+                ident, nonce, _tab = json.loads("[" + expression.split("window.__loomParked(")[1]
+                                                .rsplit(")", 1)[0] + "]")
+                value = self.pending.get(ident) == nonce
+            elif expression.startswith("window.__loomRelease &&"):
                 value = True
             elif "el.innerText" in expression:
                 value = {"text": self.page_text}
@@ -144,9 +151,18 @@ class FakeCDP:
         future.result(5)
 
     def page_calls_create(self, index, **ask):
+        """A create() the page guard parks: it holds a nonce for it."""
+        ident, nonce = os.urandom(16).hex(), os.urandom(16).hex()
+        self.pending[ident] = nonce
         self.event(index, "Runtime.bindingCalled", {
             "name": passkeys_module.BINDING, "executionContextId": 7,
-            "payload": json.dumps({"id": os.urandom(16).hex(), **ask})})
+            "payload": json.dumps({"id": ident, "nonce": nonce, **ask})})
+
+    def page_forges_ask(self, index, **fields):
+        """The page calls the binding itself: nothing is parked behind it."""
+        self.event(index, "Runtime.bindingCalled", {
+            "name": passkeys_module.BINDING, "executionContextId": 7,
+            "payload": json.dumps({"id": os.urandom(16).hex(), **fields})})
 
     def release_modes(self):
         out = []
@@ -157,9 +173,12 @@ class FakeCDP:
         return out
 
     def mint(self, index, rp_id="example.com", ident=b"minted-credential", handle=HANDLE):
+        """`handle=None` is a non-resident credential: it has no userHandle."""
         credential = {"credentialId": base64.b64encode(ident).decode(), "rpId": rp_id,
-                      "isResidentCredential": True, "privateKey": KEY,
-                      "userHandle": handle, "signCount": 0}
+                      "isResidentCredential": handle is not None, "privateKey": KEY,
+                      "signCount": 0}
+        if handle is not None:
+            credential["userHandle"] = handle
         self.credentials[index][credential["credentialId"]] = credential
         self.event(index, "WebAuthn.credentialAdded",
                    {"authenticatorId": f"auth{index}", "credential": credential})
@@ -344,8 +363,9 @@ def test_redaction_masks_json_escaped_forms(client):
 
 
 def test_redaction_masks_every_json_escape_form(client, workspace):
-    # json.dumps writes these as \u00e9, \u2603, \u0000, \b, \f, \u001f ...
-    tricky = "pre\u0000\b\f\u001f\u00e9\u2603\U0001F600post"
+    # json.dumps writes these as \u00e9, \u2603, \b, \f, \u001f ... (a NUL is
+    # refused in a variable at PUT, so it is not here)
+    tricky = "pre\b\f\u001f\u00e9\u2603\U0001F600post"
     (workspace / "t.txt").write_text(tricky, encoding="utf-8")
     put_secrets(client, {"T": tricky, "U": "caf\u00e9-\u2603-\x01\x1b-end"})
     results = [
@@ -356,7 +376,7 @@ def test_redaction_masks_every_json_escape_form(client, workspace):
     ]
     for result in results:
         blob = json.dumps(result) + result["content"][0]["text"]
-        for piece in ("\\u0000", "\\b", "\\f", "\\u001f", "\\u00e9", "\\u2603",
+        for piece in ("\\b", "\\f", "\\u001f", "\\u00e9", "\\u2603",
                       "\\u0001", "\\u001b", "post", "-end", "caf"):
             assert piece not in blob, (piece, blob)
         assert "pre" not in result["content"][0]["text"].replace("[REDACTED]", "")
@@ -769,17 +789,94 @@ def _approve(client, fake, **ask):
 OTHER_HANDLE = base64.b64encode(b"someone-else").decode()
 
 
-def test_a_second_credential_while_approved_is_removed_and_not_reported(make):
+def test_a_stray_credential_while_approved_is_removed_and_not_reported(make):
     fake, client = make(["https://example.com"])
     with client:
-        _approve(client, fake, userId=HANDLE)
-        stray = fake.mint(0, ident=b"stray-credential", handle=OTHER_HANDLE)
+        _approve(client, fake)
+        stray = fake.mint(0, rp_id="other.test", ident=b"stray-credential")
         assert wait_for(lambda: stray["credentialId"] not in fake.credentials[0])
+        assert status(client)["status"] == "approved"
+        # planted with no event, same site: only a look finds it, and removes it
+        planted = {"credentialId": base64.b64encode(b"planted").decode(),
+                   "rpId": "example.com", "isResidentCredential": False,
+                   "privateKey": KEY, "signCount": 0}
+        fake.credentials[0][planted["credentialId"]] = planted
+        assert wait_for(lambda: planted["credentialId"] not in fake.credentials[0], 6)
         assert status(client)["status"] == "approved"
         minted = fake.mint(0, ident=b"the-real-credential")
         assert wait_for(lambda: status(client)["status"] == "registered")
         assert status(client)["passkey"]["credentialId"] == minted["credentialId"]
         assert minted["credentialId"] in fake.credentials[0]
+
+
+def test_a_non_resident_mint_without_a_user_handle_is_the_approved_credential(make):
+    fake, client = make(["https://example.com"])
+    with client:
+        _approve(client, fake, userName="alice")
+        minted = fake.mint(0, ident=b"non-resident", handle=None)
+        assert "userHandle" not in minted
+        assert wait_for(lambda: status(client)["status"] == "registered")
+        passkey = status(client)["passkey"]
+        assert passkey["credentialId"] == minted["credentialId"]
+        assert "userHandle" not in passkey
+        time.sleep(1.5)
+        assert minted["credentialId"] in fake.credentials[0]
+
+
+def test_ask_with_no_or_wrong_nonce_is_denied_and_never_parks(make):
+    fake, client = make(["https://example.com"])
+    with client:
+        arm(client)
+        assert wait_for(lambda: 0 in fake.sockets)
+        fake.page_forges_ask(0, rpId="example.com", userName="mallory")  # no nonce
+        assert wait_for(lambda: fake.release_modes() == ["deny"])
+        fake.page_forges_ask(0, rpId="example.com", nonce=os.urandom(16).hex())  # unknown
+        assert wait_for(lambda: fake.release_modes() == ["deny", "deny"])
+        fake.page_forges_ask(0, rpId="example.com", nonce="x" * 32)  # not even hex
+        assert wait_for(lambda: fake.release_modes() == ["deny"] * 3)
+        assert status(client)["status"] == "armed"
+        # a real create is still parked afterwards: nothing was spent
+        fake.page_calls_create(0, rpId="example.com")
+        assert wait_for(lambda: status(client)["status"] == "asked")
+        # and a forged ask cannot displace it or borrow its approval
+        fake.page_forges_ask(0, rpId="example.com", nonce=os.urandom(16).hex())
+        assert wait_for(lambda: fake.release_modes() == ["deny"] * 4)
+        assert status(client)["status"] == "asked"
+
+
+_GUARD_HARNESS = r"""
+const guard = %s;
+const calls = [];
+const asked = [];
+class CredentialsContainer {}
+CredentialsContainer.prototype.create = function (o) { calls.push(o); return Promise.resolve('native'); };
+CredentialsContainer.prototype.get = function () { return Promise.resolve('get'); };
+global.window = global;
+global.CredentialsContainer = CredentialsContainer;
+window.__ask = (p) => asked.push(JSON.parse(p));
+guard('__ask', 'tab-secret');
+const container = new CredentialsContainer();
+let reads = 0;
+const options = {get publicKey() { reads += 1; return reads === 1 ? undefined : {rp: {id: 'example.com'}, user: {name: 'a'}}; }};
+container.create(options).then(() => {
+  const nativeSaw = calls.map((c) => !!c.publicKey);
+  console.log(JSON.stringify({asked: asked.length, native: nativeSaw}));
+});
+"""
+
+
+def test_stateful_publickey_getter_does_not_slip_past_the_guard():
+    import shutil
+    import subprocess
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is not installed")
+    harness = _GUARD_HARNESS % passkeys_module._GUARD
+    out = subprocess.run([node, "-e", harness], capture_output=True, text=True, timeout=20)
+    assert out.returncode == 0, out.stderr
+    seen = json.loads(out.stdout)
+    # the one read said "no publicKey": the native create got a copy without it
+    assert seen == {"asked": 0, "native": [False]}
 
 
 def test_a_credential_after_the_approved_one_is_removed(make):
@@ -851,3 +948,94 @@ def test_download_is_unchanged_without_a_matching_value(client, workspace):
     (workspace / "plain.bin").write_bytes(b"\x00\x01 nothing here")
     r = client.get("/files/download", params={"path": "plain.bin"}, headers=AUTH)
     assert r.content == b"\x00\x01 nothing here"
+
+
+# -- round 2: download masking is live, truncation counts masked bytes -------------
+
+def test_download_masks_a_value_granted_mid_stream(workspace):
+    app = create_app(TOKEN, workspace=str(workspace), browser=Browser("http://127.0.0.1:1"))
+    later = "late-granted-value"
+    pad = b"." * (65536 * 3)
+    (workspace / "slow.bin").write_bytes(pad + later.encode() + b"-end")
+
+    async def run():
+        sent, granted, body = [], False, b""
+        scope = {"type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1",
+                 "method": "GET", "scheme": "http", "path": "/files/download",
+                 "raw_path": b"/files/download", "root_path": "",
+                 "query_string": b"path=slow.bin", "server": ("t", 80),
+                 "client": ("c", 1),
+                 "headers": [(b"authorization", f"Bearer {TOKEN}".encode())]}
+
+        async def receive():
+            await asyncio.sleep(3600)
+
+        async def send(message):
+            nonlocal granted, body
+            if message["type"] == "http.response.body":
+                body += message.get("body", b"")
+                if not granted:  # the first bytes are out; now the value is granted
+                    granted = True
+                    app.state.secrets.replace({"L": later})
+        await app(scope, receive, send)
+        return body
+
+    body = asyncio.run(run())
+    assert later.encode() not in body
+    assert body.endswith(b"[REDACTED]-end")
+
+
+def test_download_truncation_counts_masked_bytes(client, workspace):
+    put_secrets(client, {"V": "x"})  # one byte becomes ten
+    (workspace / "m.bin").write_bytes(b"axb")
+    r = client.get("/files/download", params={"path": "m.bin", "max_bytes": "4"},
+                   headers=AUTH)
+    assert r.status_code == 200
+    assert r.content == b"a[RE"
+    assert len(r.content) == 4
+    assert r.headers["X-Loom-Truncated"] == "true"
+    # 3 raw bytes but 3 masked bytes fit exactly under a larger cut: not truncated
+    (workspace / "n.bin").write_bytes(b"abc")
+    r = client.get("/files/download", params={"path": "n.bin", "max_bytes": "3"},
+                   headers=AUTH)
+    assert r.content == b"abc" and r.headers["X-Loom-Truncated"] == "false"
+    # raw size 12 is over the cut, but the masked body is [REDACTED] (10 <= 10)
+    (workspace / "o.bin").write_bytes(b"xxxxxxxxxx")
+    r = client.get("/files/download", params={"path": "o.bin", "max_bytes": "100"},
+                   headers=AUTH)
+    assert r.content == b"[REDACTED]" * 10 and r.headers["X-Loom-Truncated"] == "false"
+
+
+# -- round 2: JSON escape spellings in error text, NUL variables -------------------
+
+def test_every_json_escape_spelling_of_a_value_is_masked():
+    store = SecretStore()
+    value = "café/\b\f\n\r\t\"\\\U0001f600\x1f-tail"
+    store.replace({"V": value})
+    spellings = {json.dumps(value, ensure_ascii=True)[1:-1],
+                 json.dumps(value, ensure_ascii=False)[1:-1]}
+    spellings |= {re.sub(r"\\u([0-9a-f]{4})", lambda m: "\\u" + m.group(1).upper(), s)
+                  for s in list(spellings)}
+    spellings |= {s.replace("/", "\\/") for s in list(spellings)}
+    assert len(spellings) >= 4
+    for spelling in spellings:
+        assert store.redact(f"error: {spelling}!") == "error: [REDACTED]!"
+
+
+def test_error_holding_the_json_escaped_value_is_masked(client):
+    value = "café-s3cret"
+    put_secrets(client, {"V": value})
+    escaped = json.dumps(value)[1:-1]  # café-s3cret as an error might spell it
+    assert "\\u00e9" in escaped
+    for spelling in (escaped, escaped.replace("\\u00e9", "\\u00E9")):
+        text = refusal(call(client, "files", {"action": "read", "path": spelling}))
+        assert "s3cret" not in text and "caf" not in text
+
+
+def test_nul_in_a_variable_is_refused_naming_the_secret_not_the_value(client):
+    put_secrets(client, {"KEEP": VAR_VALUE})
+    r = put_secrets(client, {"MY_NUL": "sekrit\x00tail"})
+    assert r.status_code == 400
+    assert "MY_NUL" in r.text and "sekrit" not in r.text and "tail" not in r.text
+    out = answer(call(client, "shell", {"command": "echo -n $KEEP | wc -c"}))
+    assert out["stdout"].strip() == str(len(VAR_VALUE))  # the old set stands

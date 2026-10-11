@@ -12,9 +12,15 @@ What is enforced, and where:
 * The page script parks `create()` and reports it; this module decides. Not
   armed, another site, another origin, or a second request: the site gets a
   `NotAllowedError` and nothing is minted.
-* An approval is bound to the one parked ceremony: its tab, its rpId and the
-  user handle the page asked to register. Only a credential that matches is
-  taken; any other, even while the approval is in flight, is removed at once.
+* A create is parked under a 128-bit nonce the page script makes with
+  `crypto.getRandomValues`. An ask counts only if the page script itself still
+  holds that nonce as a parked request (checked with the tab's secret, which
+  the page cannot read): a page calling the binding directly is denied and
+  nothing is parked.
+* An approval is bound to the one parked ceremony: its tab, its rpId and its
+  nonce. The first credential added on that tab for that rpId is the mint (a
+  non-resident credential has no user handle to match); any other, even while
+  the approval is in flight, is removed at once.
 * The page script is the first line only. A credential that appears in an
   authenticator without an approval for this very arming, or for another site,
   or after the ten minutes, is removed (on its event and on every look).
@@ -49,22 +55,28 @@ _GUARD = """(binding, nonce) => {
   const pending = new Map();
   const newId = () => Array.from(crypto.getRandomValues(new Uint8Array(16)),
                                  (b) => b.toString(16).padStart(2, '0')).join('');
-  const b64 = (v) => { try {
-    const u = v instanceof ArrayBuffer ? new Uint8Array(v)
-      : new Uint8Array(v.buffer, v.byteOffset, v.byteLength);
-    return btoa(String.fromCharCode(...u)).slice(0, 400);
-  } catch (e) { return null; } };
   const text = (v) => { try { return v == null ? null : String(v).slice(0, 200); } catch (e) { return null; } };
   const guarded = function create(options) {
-    if (!options || !options.publicKey) return original.apply(this, arguments);
-    const self = this, args = arguments, pk = options.publicKey;
+    // One read of publicKey: a getter that answers differently the second
+    // time must not get a second look. What goes to the native create is a
+    // copy holding exactly what was read here.
+    const pk = options ? options.publicKey : undefined;
+    const self = this;
+    const opts = options ? Object.assign({}, options) : options;
+    if (!pk) {
+      if (opts) delete opts.publicKey;
+      return original.call(self, opts);
+    }
+    opts.publicKey = pk;
     return new Promise((resolve, reject) => {
       const id = newId();
-      pending.set(id, {resolve, reject, run: () => original.apply(self, args)});
+      const askNonce = newId();
+      pending.set(id, {resolve, reject, nonce: askNonce,
+                       run: () => original.call(self, opts)});
       let rp = {}, user = {};
       try { rp = pk.rp || {}; user = pk.user || {}; } catch (e) {}
-      ask(JSON.stringify({id, rpId: text(rp.id), rpName: text(rp.name),
-                          userName: text(user.name), userId: b64(user.id),
+      ask(JSON.stringify({id, nonce: askNonce, rpId: text(rp.id), rpName: text(rp.name),
+                          userName: text(user.name),
                           userDisplayName: text(user.displayName)}));
     });
   };
@@ -92,11 +104,20 @@ _GUARD = """(binding, nonce) => {
       'The operation either timed out or was not allowed.', 'NotAllowedError'));
     return true;
   };
+  // Is this ask a create the guard itself is holding? The computer asks
+  // before it parks anything.
+  const parked = (id, askNonce, given) => {
+    if (given !== nonce) return false;
+    const entry = pending.get(id);
+    return !!entry && entry.nonce === askNonce;
+  };
   Object.defineProperty(proto, 'create', {value: guarded, configurable: true, writable: true});
   if (typeof originalGet === 'function')
     Object.defineProperty(proto, 'get', {value: guardedGet, configurable: true, writable: true});
   try { Object.defineProperty(window, '__loomRelease',
         {value: release, configurable: false, writable: false}); } catch (e) {}
+  try { Object.defineProperty(window, '__loomParked',
+        {value: parked, configurable: false, writable: false}); } catch (e) {}
 }"""
 
 
@@ -170,13 +191,23 @@ class _Tab:
 
 
 @dataclass
+class _Parked:
+    """A create() the page script holds, verified with the page."""
+    tab: _Tab
+    context: int  # execution context id
+    ident: str  # page-side id
+    rp_id: str
+    origin: str
+
+
+@dataclass
 class _Registration:
     rp_id: str
     expires: float
     status: str = "armed"  # armed -> asked -> approved -> registered
     ask: dict | None = None
-    parked: tuple | None = None  # (tab, execution context id, page-side id)
-    user_handle: bytes | None = None  # the user.id the parked ceremony registers
+    parked: str | None = None  # nonce of the asked, parked request
+    approved: tuple | None = None  # (tab, rpId, nonce) of the approved ceremony
     passkey: dict | None = None
 
 
@@ -187,6 +218,7 @@ class Passkeys:
         self._clock = clock
         self._tabs: dict[str, _Tab] = {}
         self._reg: _Registration | None = None
+        self._parked: dict[str, _Parked] = {}  # nonce -> the request it names
         self._loop: asyncio.AbstractEventLoop | None = None
         self._runner: asyncio.Task | None = None
         self._attach_lock: asyncio.Lock | None = None
@@ -200,6 +232,7 @@ class Passkeys:
         if self._loop is loop and self._runner and not self._runner.done():
             return
         self._tabs.clear()
+        self._parked.clear()
         self._loop, self._attach_lock = loop, asyncio.Lock()
         self._runner = loop.create_task(self._watch())
 
@@ -351,8 +384,10 @@ class Passkeys:
         await tab.conn.close()
         if tab.reader:
             tab.reader.cancel()
+        for nonce in [n for n, p in self._parked.items() if p.tab is tab]:
+            del self._parked[nonce]
         reg = self._reg
-        if reg and reg.parked and reg.parked[0] is tab and reg.status == "asked":
+        if reg and reg.status == "asked" and reg.parked not in self._parked:
             reg.status, reg.ask, reg.parked = "armed", None, None
 
     # -- authenticator contents -----------------------------------------------
@@ -366,17 +401,9 @@ class Passkeys:
     def _is_ceremony(self, tab: _Tab, credential: dict) -> bool:
         """The credential is the one the approved, parked ceremony mints."""
         reg = self._reg
-        if (reg is None or reg.status != "approved" or not reg.parked
-                or reg.parked[0] is not tab or credential.get("rpId") != reg.rp_id
-                or not credential.get("privateKey")):
-            return False
-        if reg.user_handle is not None:
-            try:
-                handle = b64_bytes(credential.get("userHandle") or "")
-            except ValueError:
-                return False
-            return handle == reg.user_handle
-        return True
+        return (reg is not None and reg.status == "approved" and reg.approved is not None
+                and reg.approved[0] is tab and credential.get("rpId") == reg.approved[1]
+                and bool(credential.get("privateKey")))
 
     async def _sync(self, tab: _Tab) -> None:
         """Make the tab's authenticator hold exactly the granted passkeys
@@ -385,17 +412,14 @@ class Passkeys:
                                   {"authenticatorId": tab.authenticator})
         wanted = {k.key: k for k in self._store.passkeys.values()}
         keep = self._protected()
-        # While an approved mint is in flight its event decides, not this look.
-        reg = self._reg
-        minting = reg is not None and reg.status == "approved"
+        # The event of an approved mint is handled before this look resumes
+        # (same socket, same order), so what is left here is not the mint.
         present: dict[bytes, dict] = {}
         for credential in got.get("credentials", []):
             ident = b64_bytes(credential["credentialId"])
             record = wanted.get(ident)
             if ident in keep and record is None:
                 present[ident] = credential
-            elif record is None and minting and self._is_ceremony(tab, credential):
-                continue
             elif record is None or credential.get("privateKey") != record.private_key:
                 await tab.conn.call("WebAuthn.removeCredential", {
                     "authenticatorId": tab.authenticator,
@@ -481,6 +505,19 @@ class Passkeys:
                 log.debug("sign-in released")
                 await self._release(tab, context, ident, "allow")
                 return
+            nonce = raw.get("nonce")
+            if (not isinstance(nonce, str) or not re.fullmatch(r"[0-9a-f]{32}", nonce)
+                    or nonce in self._parked):
+                await self._release(tab, context, ident, "deny")
+                return
+            held = await tab.conn.call("Runtime.evaluate", {
+                "expression": (f"window.__loomParked && window.__loomParked("
+                               f"{json.dumps(ident)}, {json.dumps(nonce)}, "
+                               f"{json.dumps(tab.nonce)})"),
+                "contextId": context, "returnByValue": True})
+            if held.get("result", {}).get("value") is not True:
+                await self._release(tab, context, ident, "deny")
+                return  # not a request the guard holds: a forged ask
             where = await tab.conn.call("Runtime.evaluate", {
                 "expression": "location.origin", "contextId": context,
                 "returnByValue": True})
@@ -501,13 +538,8 @@ class Passkeys:
                 for key in ("rpName", "userName", "userDisplayName"):
                     if _clip(raw.get(key)):
                         asked[key] = _clip(raw[key])
-                reg.status, reg.ask, reg.parked = "asked", asked, (tab, context, ident)
-                reg.user_handle = None
-                if isinstance(raw.get("userId"), str) and raw["userId"]:
-                    try:
-                        reg.user_handle = b64_bytes(raw["userId"])
-                    except ValueError:
-                        pass
+                self._parked[nonce] = _Parked(tab, context, ident, rp_id, origin)
+                reg.status, reg.ask, reg.parked = "asked", asked, nonce
         if asked is None:
             await self._release(tab, context, ident, "deny")
 
@@ -530,7 +562,7 @@ class Passkeys:
                 if reg.ask and reg.ask.get(key):
                     record[key] = reg.ask[key]
             self._store.remember(record["privateKey"])
-            reg.status, reg.passkey, reg.parked = "registered", record, None
+            reg.status, reg.passkey, reg.approved = "registered", record, None
             return
         try:
             await tab.conn.call("WebAuthn.removeCredential", {
@@ -545,10 +577,11 @@ class Passkeys:
         reg = self._reg
         if reg is None or reg.status == "registered" or self._clock() < reg.expires:
             return
-        parked, self._reg = reg.parked, None
+        parked = self._parked.pop(reg.parked, None) if reg.parked else None
+        self._reg = None
         if parked and self._loop:
-            tab, context, ident = parked
-            asyncio.ensure_future(self._release(tab, context, ident, "deny"))
+            asyncio.ensure_future(self._release(
+                parked.tab, parked.context, parked.ident, "deny"))
 
     async def arm(self, rp_id: str) -> dict:
         await self._cancel_parked()
@@ -562,8 +595,9 @@ class Passkeys:
 
     async def _cancel_parked(self) -> None:
         reg = self._reg
-        if reg and reg.parked and reg.status == "asked":
-            await self._release(*reg.parked, "deny")
+        parked = self._parked.pop(reg.parked, None) if reg and reg.parked else None
+        if parked and reg.status == "asked":
+            await self._release(parked.tab, parked.context, parked.ident, "deny")
 
     def status(self) -> dict:
         self._expire()
@@ -584,15 +618,18 @@ class Passkeys:
         reg = self._reg
         if reg is None or reg.status != "asked" or not reg.ask or reg.ask["id"] != ident:
             return False
+        nonce, parked = reg.parked, self._parked.pop(reg.parked, None)
+        if parked is None:
+            return False
         if approved:
-            reg.status = "approved"
-            tab, context, ident = reg.parked
+            reg.status, reg.parked = "approved", None
+            reg.approved = (parked.tab, parked.rp_id, nonce)
             try:
-                await self._settle(tab, context)
+                await self._settle(parked.tab, parked.context)
             except Exception:  # noqa: BLE001 - the page's create() goes ahead regardless
                 log.debug("could not ready a registration", exc_info=True)
-            await self._release(tab, context, ident, "allow")
+            await self._release(parked.tab, parked.context, parked.ident, "allow")
         else:
-            parked, self._reg = reg.parked, None
-            await self._release(*parked, "deny")
+            self._reg = None
+            await self._release(parked.tab, parked.context, parked.ident, "deny")
         return True

@@ -10,6 +10,7 @@ and what the browser profile keeps, is outside this store.)
 import base64
 import binascii
 import hmac
+import json
 import logging
 import re
 import struct
@@ -161,6 +162,7 @@ class SecretStore:
         self.logins: dict[str, Login] = {}
         self.passkeys: dict[str, Passkey] = {}
         self._needles: list[tuple[str, str]] = []
+        self._encoded: list[bytes] | None = None  # `_needles` as bytes, built on use
         self._listeners: list = []
         self.extra: set[str] = set()  # minted-but-not-yet-delivered values to redact
         # Values a live job still holds in its environment after the set was
@@ -184,6 +186,9 @@ class SecretStore:
             if not isinstance(name, str) or not name:
                 raise SecretsError("a secret needs a non-empty name")
             if isinstance(value, str):
+                if "\0" in value:  # an environment cannot hold a NUL
+                    raise SecretsError(
+                        f"secret {_shown(name)}: value must not contain a NUL character")
                 variables[name] = value
             elif isinstance(value, dict):
                 kind = value.get("kind")
@@ -257,14 +262,19 @@ class SecretStore:
 
     def _rebuild(self) -> None:
         # Longest first, so a value that holds another is masked whole. Each
-        # value is also masked as a JSON string body would carry it.
+        # value is also masked in every spelling a JSON string body can give
+        # it: \uXXXX in either case, the short escapes, and \/.
         needles = set()
         for value in self._values():
             needles.add(value)
-            escaped = value.replace("\\", "\\\\").replace('"', '\\"') \
-                .replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
-            needles.add(escaped)
+            for ascii_only in (False, True):
+                body = json.dumps(value, ensure_ascii=ascii_only)[1:-1]
+                for form in (body, body.replace("/", "\\/")):
+                    needles.add(form)
+                    needles.add(re.sub(r"\\u([0-9a-f]{4})",
+                                       lambda m: "\\u" + m.group(1).upper(), form))
         self._needles = [(n, REDACTED) for n in sorted(needles, key=len, reverse=True)]
+        self._encoded = None
 
     def remember(self, value: str) -> None:
         """Add a value minted at runtime (a new passkey's key) to the masks."""
@@ -300,10 +310,16 @@ class SecretStore:
         self._next_expiry = min(self._timed.values(), default=float("inf"))
         self._rebuild()
 
-    def byte_masker(self) -> "ByteMask":
-        """A streaming masker over the needles as they stand now."""
+    def _live_needles(self) -> list[bytes]:
         self._prune()
-        return ByteMask([n.encode("utf-8") for n, _ in self._needles])
+        if self._encoded is None:
+            self._encoded = [n.encode("utf-8") for n, _ in self._needles]
+        return self._encoded
+
+    def byte_masker(self) -> "ByteMask":
+        """A streaming masker that asks for the needles as they stand at each
+        chunk, so a value granted mid-stream is masked from then on."""
+        return ByteMask(self._live_needles)
 
     def redact(self, text: str) -> str:
         self._prune()
@@ -345,35 +361,32 @@ class ByteMask:
     start of one. Best-effort: a value the file holds in another encoding
     (base64, split, compressed) is not seen."""
 
-    def __init__(self, needles: list[bytes]):
-        self._needles = [n for n in needles if n]
-        self._keep = max((len(n) for n in self._needles), default=1) - 1
+    def __init__(self, source):
+        self._source = source  # () -> the needles as they stand now
         self._mask = REDACTED.encode()
         self._carry = b""
 
-    @property
-    def active(self) -> bool:
-        return bool(self._needles)
-
-    def _replace(self, data: bytes) -> bytes:
-        for needle in self._needles:
+    def _replace(self, data: bytes, needles: list[bytes]) -> bytes:
+        for needle in needles:
             if needle in data:
                 data = data.replace(needle, self._mask)
         return data
 
     def feed(self, chunk: bytes) -> bytes:
-        data = self._replace(self._carry + chunk)
-        if self._keep and len(data) > self._keep:
-            self._carry, data = data[-self._keep:], data[:-self._keep]
+        needles = self._source()
+        keep = max((len(n) for n in needles), default=1) - 1
+        data = self._replace(self._carry + chunk, needles)
+        if keep and len(data) > keep:
+            self._carry, data = data[-keep:], data[:-keep]
             return data
-        if self._keep:
+        if keep:
             self._carry, data = data, b""
             return data
         self._carry = b""
         return data
 
     def flush(self) -> bytes:
-        data, self._carry = self._replace(self._carry), b""
+        data, self._carry = self._replace(self._carry, self._source()), b""
         return data
 
 

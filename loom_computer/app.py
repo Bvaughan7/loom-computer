@@ -66,6 +66,11 @@ class _OwnedFd:
         with self._lock:
             return os.read(self._fd, n) if self._fd is not None else b""
 
+    def pread(self, n: int, offset: int) -> bytes:
+        """Bytes at `offset`, leaving the read position where it was."""
+        with self._lock:
+            return os.pread(self._fd, n, offset) if self._fd is not None else b""
+
     def close(self) -> None:
         with self._lock:
             if self._fd is not None:
@@ -314,20 +319,22 @@ def create_app(token: str, desktop: Desktop | None = None,
             return _download_error(400, text)
         owned = _OwnedFd(fd)
         # Granted values are masked in the bytes as they leave (best-effort,
-        # byte-level), so the length is only known up front when none apply.
+        # byte-level), asking the live set at every chunk. The cut counts
+        # masked bytes, so whether it applies is found by a pass over the
+        # file first; the length is never known up front.
         mask = store.byte_masker()
-        length = size if limit is None else min(size, limit)
+        truncated = False
+        if limit is not None:
+            probe, seen, offset = store.byte_masker(), 0, 0
+            while seen <= limit:
+                chunk = await asyncio.to_thread(owned.pread, 65536, offset)
+                offset += len(chunk)
+                seen += len(probe.feed(chunk) if chunk else probe.flush())
+                if not chunk:
+                    break
+            truncated = seen > limit
 
         async def body():
-            if not mask.active:
-                left = length
-                while left > 0:
-                    chunk = await asyncio.to_thread(owned.read, min(65536, left))
-                    if not chunk:
-                        break
-                    left -= len(chunk)
-                    yield chunk
-                return
             left = limit  # bytes of masked output; None is no cut
             while left is None or left > 0:
                 chunk = await asyncio.to_thread(owned.read, 65536)
@@ -340,13 +347,8 @@ def create_app(token: str, desktop: Desktop | None = None,
                 if not chunk:
                     break
 
-        headers = {"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"}
-        if not mask.active:
-            headers["Content-Length"] = str(length)
-            headers["X-Loom-Truncated"] = "true" if length < size else "false"
-        else:
-            headers["X-Loom-Redacted"] = "best-effort"
-            headers["X-Loom-Truncated"] = "true" if limit is not None and size > limit else "false"
+        headers = {"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff",
+                   "X-Loom-Truncated": "true" if truncated else "false"}
         return _FdResponse(owned, body(), media_type="application/octet-stream",
                            headers=headers)
 
