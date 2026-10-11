@@ -99,14 +99,15 @@ Design:
   covers every host beneath it, `attacker.com` included. No public-suffix
   list is built in; a hand-rolled one would be incomplete and misleading.
   `files read` with `encoding: base64` masks values at the byte level before
-  encoding, so decoded bytes never spell a granted value. The text redactor
-  is skipped for the encoded content only, to keep the base64 valid; the
-  `path` is masked as usual. A granted value must not contain the literal
-  `[REDACTED]` (a shorter value masked inside it could re-spell it); such a
-  set is rejected at PUT. The residual: a short granted value's characters
-  can coincide with a substring of the base64 text itself, and that
-  coincidence is not masked in the encoded string, while the decoded bytes
-  stay clean.
+  encoding. The text redactor is skipped for the encoded content only, to
+  keep the base64 valid; the `path` is masked as usual. The `[REDACTED]`
+  token is atomic and public, so the guarantee is about recovery, not
+  byte-substrings: masked output never lets the agent recover a granted
+  value. A short value's characters may coincide with the token's own text
+  (any one-character value occurs inside every token) or with a substring
+  of the base64 text, but neither coincidence reveals the value — what the
+  token replaced stays hidden. A granted value must not contain the literal
+  `[REDACTED]`; such a set is rejected at PUT.
 - **Logins.** `browser fill {selector, secret, field?}`; the page origin is
   read and checked against `sites` and the typing happens in the same page
   evaluation guarded by that origin, so a navigation cannot slip between. A

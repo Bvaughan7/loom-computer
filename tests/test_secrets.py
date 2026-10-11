@@ -350,18 +350,18 @@ def test_base64_and_utf8_reads_mask_a_secret_in_the_path(client, workspace):
         assert answer(out)["path"] == "[REDACTED]"
 
 
-@pytest.mark.parametrize("body", [
-    {"BAD": "A[REDACTED]Z"},
-    {"BAD": {"kind": "login", "sites": ["a.com"], "username": "u[REDACTED]",
-             "password": "p"}},
-    {"BAD": {"kind": "login", "sites": ["a.com"], "username": "u",
-             "password": "p[REDACTED]"}},
+@pytest.mark.parametrize("body, absent", [
+    ({"BAD": "A[REDACTED]Z"}, "A[REDACTED]Z"),
+    ({"BAD": {"kind": "login", "sites": ["a.com"], "username": "u[REDACTED]",
+              "password": "p"}}, "u[REDACTED]"),
+    ({"BAD": {"kind": "login", "sites": ["a.com"], "username": "u",
+              "password": "p[REDACTED]"}}, "p[REDACTED]"),
 ])
-def test_a_value_holding_the_mask_token_is_400_naming_the_secret(client, body):
+def test_a_value_holding_the_mask_token_is_400_naming_the_secret(client, body, absent):
     put_secrets(client, {"KEEP": VAR_VALUE})
     r = put_secrets(client, body)
     assert r.status_code == 400
-    assert "BAD" in r.json()["error"] and "A[REDACTED]Z" not in r.text
+    assert "BAD" in r.json()["error"] and absent not in r.text
     out = answer(call(client, "shell", {"command": "echo -n $KEEP"}))
     assert out["stdout"] == "[REDACTED]"  # the old set stands
     assert put_secrets(client, {"V": VAR_VALUE}).status_code == 200
