@@ -216,7 +216,7 @@ class Tools:
     async def _files_run(self, path, args: dict) -> dict:
         # The script is opened once, without following links, and run from
         # that descriptor: the file that was checked is the file that runs.
-        fd, _, rel = await _blocking(self.workspace.open_regular, path)
+        fd, _, rel = await self.workspace.open_regular_async(path)
         try:
             script_args = args.get("args", [])
             if not isinstance(script_args, list) or not all(isinstance(a, str) for a in script_args):

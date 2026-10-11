@@ -21,7 +21,6 @@ MAX_TEXT = 100_000
 MAX_TREE_LINES = 2000
 MAX_TREE_BYTES = 200_000
 MAX_TREE_FIELD = 500  # characters of one node name or value
-MAX_PAGES_PROBED = 16
 SCHEMES = ("http:", "https:", "file:", "about:", "data:")
 
 _FILL = """(selector, value) => {
@@ -161,11 +160,10 @@ class Browser:
         """The active tab's debugger URL; the first page if none can say."""
         pages = await self._pages()
         if len(pages) > 1:
-            probed = pages[:MAX_PAGES_PROBED]
-            ranks = await asyncio.gather(*(self._probe(p) for p in probed))
-            best = max(range(len(probed)), key=lambda i: (ranks[i], -i))
+            ranks = await asyncio.gather(*(self._probe(p) for p in pages))
+            best = max(range(len(pages)), key=lambda i: (ranks[i], -i))
             if ranks[best] > 0:
-                return probed[best]["webSocketDebuggerUrl"]
+                return pages[best]["webSocketDebuggerUrl"]
         return pages[0]["webSocketDebuggerUrl"]
 
     async def _with_page(self, work):
@@ -173,15 +171,22 @@ class Browser:
         from websockets.exceptions import WebSocketException
 
         async with self._lock:
-            url = await self._target()
-            try:
-                async with connect(url, max_size=64 * 1024 * 1024, open_timeout=5,
-                                   ping_interval=None, compression=None) as socket:
-                    return await work(_Session(socket))
-            except asyncio.TimeoutError:
-                raise ToolError("Chromium did not answer in time") from None
-            except (OSError, WebSocketException):
-                raise ToolError("lost the connection to Chromium") from None
+            for attempt in (1, 2):
+                url = await self._target()
+                started = False
+                try:
+                    async with connect(url, max_size=64 * 1024 * 1024, open_timeout=5,
+                                       ping_interval=None, compression=None) as socket:
+                        started = True
+                        return await work(_Session(socket))
+                except asyncio.TimeoutError:
+                    raise ToolError("Chromium did not answer in time") from None
+                except (OSError, WebSocketException):
+                    # The tab closed between probing and connecting: choose
+                    # again among the remaining tabs, once. Work that already
+                    # began is never repeated.
+                    if started or attempt == 2:
+                        raise ToolError("lost the connection to Chromium") from None
 
     async def navigate(self, url) -> dict:
         if not isinstance(url, str) or not url.lower().startswith(SCHEMES):

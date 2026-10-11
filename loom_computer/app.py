@@ -11,6 +11,8 @@ import logging
 import os
 import re
 import sys
+import threading
+import weakref
 from importlib import resources
 
 from fastapi import FastAPI, Request, WebSocket
@@ -45,8 +47,44 @@ def _viewer_page() -> tuple[str, str]:
 
 
 def _download_error(status: int, message: str) -> JSONResponse:
-    return JSONResponse({"error": "download_failed", "message": message},
+    # `error` is the human-facing reason the desk shows; `code` is the
+    # machine-readable class.
+    return JSONResponse({"error": message, "code": "download_failed"},
                         status_code=status)
+
+
+class _OwnedFd:
+    """A descriptor with exactly one closer, safe against a read in flight."""
+
+    def __init__(self, fd: int):
+        self._fd: int | None = fd
+        self._lock = threading.Lock()
+
+    def read(self, n: int) -> bytes:
+        with self._lock:
+            return os.read(self._fd, n) if self._fd is not None else b""
+
+    def close(self) -> None:
+        with self._lock:
+            if self._fd is not None:
+                fd, self._fd = self._fd, None
+                os.close(fd)
+
+
+class _FdResponse(StreamingResponse):
+    """Closes its descriptor when the response ends, is cancelled, or is
+    dropped without ever being sent."""
+
+    def __init__(self, owned: _OwnedFd, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._finalizer = weakref.finalize(self, owned.close)
+        self._owned = owned
+
+    async def __call__(self, scope, receive, send):
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            self._owned.close()
 
 
 def _skill_document() -> str:
@@ -202,7 +240,7 @@ def create_app(token: str, desktop: Desktop | None = None,
                 return _download_error(400, "max_bytes must be a non-negative integer")
             limit = int(max_bytes)
         try:
-            fd, size, _ = await asyncio.to_thread(tools.workspace.open_regular, path)
+            fd, size, _ = await tools.workspace.open_regular_async(path)
         except ToolError as exc:
             text = str(exc)
             if text == "no such file":
@@ -212,17 +250,18 @@ def create_app(token: str, desktop: Desktop | None = None,
             return _download_error(400, text)
         length = size if limit is None else min(size, limit)
 
+        owned = _OwnedFd(fd)
+
         async def body():
             left = length
-            with os.fdopen(fd, "rb") as handle:
-                while left > 0:
-                    chunk = await asyncio.to_thread(handle.read, min(65536, left))
-                    if not chunk:
-                        break
-                    left -= len(chunk)
-                    yield chunk
+            while left > 0:
+                chunk = await asyncio.to_thread(owned.read, min(65536, left))
+                if not chunk:
+                    break
+                left -= len(chunk)
+                yield chunk
 
-        return StreamingResponse(body(), media_type="application/octet-stream", headers={
+        return _FdResponse(owned, body(), media_type="application/octet-stream", headers={
             "Content-Length": str(length), "Cache-Control": "no-store",
             "X-Content-Type-Options": "nosniff",
             "X-Loom-Truncated": "true" if length < size else "false"})

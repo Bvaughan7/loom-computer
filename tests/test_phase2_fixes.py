@@ -318,7 +318,7 @@ def test_download_honors_max_bytes(client, workspace):
 
 def test_download_missing_is_404(client):
     r = client.get("/files/download", params={"path": "nope.txt"}, headers=AUTH)
-    assert r.status_code == 404 and r.json()["error"] == "download_failed"
+    assert r.status_code == 404 and r.json()["error"] == "no such file" and r.json()["code"] == "download_failed"
 
 
 @pytest.mark.parametrize("path", ["../outside.txt", "a/../../outside.txt",
@@ -341,3 +341,121 @@ def test_download_refuses_symlink_out_and_directories(client, workspace, tmp_pat
         assert r.status_code == 403 and b"top secret" not in r.content
     assert client.get("/files/download", params={"path": "d"}, headers=AUTH).status_code == 400
     assert client.get("/files/download", headers=AUTH).status_code == 400
+
+
+# -- 8. descriptor ownership and the human-facing error ----------------------
+
+import gc
+
+
+def open_fds() -> int:
+    return len(os.listdir("/proc/self/fd"))
+
+
+def slow_open(release: threading.Event, entered: threading.Event):
+    """An `open_regular` that opens the file, then waits in its worker thread."""
+    real = Workspace.open_regular
+
+    def slow(self, path):
+        entered.set()
+        release.wait(5)
+        return real(self, path)
+    return slow
+
+
+async def cancel_while_opening(monkeypatch, make_call):
+    release, entered = threading.Event(), threading.Event()
+    monkeypatch.setattr(Workspace, "open_regular", slow_open(release, entered))
+    before = open_fds()
+    task = asyncio.ensure_future(make_call())
+    while not entered.is_set():
+        await asyncio.sleep(0.01)
+    task.cancel()
+    await asyncio.sleep(0)
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    for _ in range(100):  # the worker thread finishes after the cancel
+        await asyncio.sleep(0.02)
+        gc.collect()
+        if open_fds() <= before:
+            break
+    assert open_fds() <= before
+
+
+def test_cancelled_download_open_does_not_leak_fd(workspace, monkeypatch):
+    (workspace / "a.txt").write_text("hi")
+    app = create_app("tools-token", workspace=str(workspace),
+                     browser=Browser("http://127.0.0.1:1"))
+    endpoint = next(r.endpoint for r in app.router.routes
+                    if getattr(r, "path", "") == "/files/download")
+    asyncio.run(cancel_while_opening(monkeypatch, lambda: endpoint(path="a.txt")))
+
+
+def test_cancelled_files_run_open_does_not_leak_fd(workspace, monkeypatch):
+    (workspace / "s.sh").write_text("echo hi\n")
+    tools = Tools(lambda: {}, SimpleNamespace(display=":0"), str(workspace))
+    asyncio.run(cancel_while_opening(
+        monkeypatch, lambda: tools.call("files", {"action": "run", "path": "s.sh"})))
+
+
+def test_abandoned_download_response_closes_fd(workspace):
+    (workspace / "a.txt").write_text("hi")
+    app = create_app("tools-token", workspace=str(workspace),
+                     browser=Browser("http://127.0.0.1:1"))
+    endpoint = next(r.endpoint for r in app.router.routes
+                    if getattr(r, "path", "") == "/files/download")
+
+    async def scenario():
+        before = open_fds()
+        response = await endpoint(path="a.txt")
+        assert open_fds() == before + 1
+        del response
+        gc.collect()
+        assert open_fds() == before
+    asyncio.run(scenario())
+
+
+def test_download_error_field_carries_the_reason(client, workspace):
+    r = client.get("/files/download", params={"path": "nope.txt"}, headers=AUTH)
+    assert r.status_code == 404
+    assert r.json()["error"] == "no such file"
+    r = client.get("/files/download", params={"path": "../x"}, headers=AUTH)
+    assert r.status_code == 403 and "outside the workspace" in r.json()["error"]
+    r = client.get("/files/download", params={"path": "a", "max_bytes": "x"}, headers=AUTH)
+    assert r.status_code == 400 and "max_bytes" in r.json()["error"]
+
+
+def test_active_tab_beyond_sixteen_pages_is_selected():
+    browser = Browser("http://127.0.0.1:1")
+    pages = [{"webSocketDebuggerUrl": f"ws://t/{i}"} for i in range(30)]
+
+    async def pages_():
+        return pages
+
+    async def probe(page):
+        return 2 if page["webSocketDebuggerUrl"].endswith("/25") else 1
+    browser._pages, browser._probe = pages_, probe
+    assert asyncio.run(browser._target()) == "ws://t/25"
+
+
+def test_vanished_tab_is_retried_once_on_another_tab():
+    browser = Browser("http://127.0.0.1:1")
+
+    async def scenario():
+        async def handler(ws):
+            await ws.send("x")
+            await ws.wait_closed()
+        async with serve(handler, "127.0.0.1", 0) as server:
+            port = server.sockets[0].getsockname()[1]
+            good = f"ws://127.0.0.1:{port}/"
+            seq = iter(["ws://127.0.0.1:1/gone", good])
+
+            async def target2():
+                return next(seq)
+            browser._target = target2
+
+            async def work(session):
+                return "ok"
+            return await browser._with_page(work)
+    assert asyncio.run(scenario()) == "ok"

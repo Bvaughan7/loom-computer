@@ -1,5 +1,6 @@
 """File operations confined to the workspace root."""
 
+import asyncio
 import base64
 import errno
 import os
@@ -86,6 +87,19 @@ class Workspace:
             os.close(fd)
             raise
         return fd, info.st_size, self.relative(real)
+
+    async def open_regular_async(self, path) -> tuple[int, int, str]:
+        """`open_regular` in a worker thread, without leaking the descriptor
+        when the caller is cancelled while the thread is finishing."""
+        task = asyncio.ensure_future(asyncio.to_thread(self.open_regular, path))
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            def close_late(done: asyncio.Future) -> None:
+                if not done.cancelled() and done.exception() is None:
+                    os.close(done.result()[0])
+            task.add_done_callback(close_late)
+            raise
 
     def read(self, path, encoding: str = "utf-8") -> dict:
         fd, size, rel = self.open_regular(path)
