@@ -57,7 +57,7 @@ def test_guide_returns_name_version_checksum(client):
     assert r.status_code == 200
     guide = r.json()["result"]["structuredContent"]
     assert guide["name"] == "loom-computer"
-    assert guide["version"] == VERSION == "0.10.3"
+    assert guide["version"] == VERSION
     assert guide["sha256"] == hashlib.sha256(guide["skill"].encode()).hexdigest()
     assert "checksum" not in guide and "content" not in guide
 

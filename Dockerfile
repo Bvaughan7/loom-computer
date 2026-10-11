@@ -28,6 +28,16 @@ RUN useradd --uid 1000 --create-home --home-dir /home/agent --shell /bin/bash ag
 WORKDIR /opt/loom-computer
 COPY requirements.txt .
 RUN pip install -r requirements.txt
+# VERSION is the single source of truth for the release (see README). The
+# build arg exists so the image label can carry it; the build fails if the arg
+# disagrees with the file, so the label and the served guide cannot drift.
+ARG VERSION
+COPY VERSION ./VERSION
+RUN test -n "$VERSION" || { echo "build with --build-arg VERSION=\$(cat VERSION)" >&2; exit 1; } \
+ && test "$VERSION" = "$(cat VERSION)" \
+ || { echo "VERSION build arg '$VERSION' != VERSION file" >&2; exit 1; }
+LABEL org.opencontainers.image.version="$VERSION" \
+      org.opencontainers.image.source="https://github.com/Bvaughan7/loom-computer"
 COPY loom_computer ./loom_computer
 COPY image ./image
 
