@@ -1,6 +1,6 @@
 """Built-image smoke test. Set LOOM_TEST_IMAGE=<tag> to run it (needs docker):
 
-    docker build -t loom-computer:test . && LOOM_TEST_IMAGE=loom-computer:test pytest tests/test_image.py
+    docker build --build-arg VERSION=$(cat VERSION) -t loom-computer:test . && LOOM_TEST_IMAGE=loom-computer:test pytest tests/test_image.py
 """
 
 import asyncio
