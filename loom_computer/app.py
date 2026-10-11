@@ -2,6 +2,7 @@
 
 import asyncio
 import base64
+import contextlib
 import copy
 import hashlib
 import hmac
@@ -17,9 +18,12 @@ from starlette.websockets import WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from . import VERSION
+from .browser import Browser
 from .desktop import Desktop, FrameHub, InputSession
+from .tools import DEFINITIONS, Tools
 
 PORT = 8787
+WORKSPACE = "/home/agent/workspace"
 SKILL_NAME = "loom-computer"
 log = logging.getLogger("loom_computer")
 
@@ -69,26 +73,11 @@ def _rpc_error(rpc_id, code: int, message: str) -> dict:
 INVALID_REQUEST = -32600
 
 
-def _not_implemented(rpc_id) -> dict:
-    return _rpc_error(rpc_id, -32601, "not implemented")
-
-
 def _invalid(rpc_id, why: str) -> dict:
     return _rpc_error(rpc_id, INVALID_REQUEST, f"invalid request: {why}")
 
 
-STATE_TOOL = {
-    "name": "state",
-    "description": "Computer state and the release guide.",
-    "inputSchema": {
-        "type": "object",
-        "properties": {"action": {"type": "string", "enum": ["guide"]}},
-        "required": ["action"],
-    },
-}
-
-
-def _handle_rpc(message: dict) -> dict | None:
+async def _handle_rpc(message: dict, tools: Tools) -> dict | None:
     """Answer one JSON-RPC message; None for a notification (no `id` member)."""
     has_id = "id" in message
     rpc_id = message.get("id")
@@ -117,30 +106,40 @@ def _handle_rpc(message: dict) -> dict | None:
             "serverInfo": {"name": SKILL_NAME, "version": VERSION},
         })
     if method == "tools/list":
-        return _rpc_result(rpc_id, {"tools": [STATE_TOOL]})
+        return _rpc_result(rpc_id, {"tools": DEFINITIONS})
     if method == "tools/call":
         args = params.get("arguments")
         if args is None:
             args = {}
         if not isinstance(args, dict):
             return _invalid(rpc_id, "arguments must be an object")
-        if params.get("name") == "state" and args.get("action") == "guide":
-            body = guide()
-            return _rpc_result(rpc_id, {
-                "content": [{"type": "text", "text": json.dumps(body)}],
-                "structuredContent": body,
-                "isError": False,
-            })
-    return _not_implemented(rpc_id)
+        name = params.get("name")
+        if not isinstance(name, str):
+            return _invalid(rpc_id, "name must be a string")
+        if not tools.has(name):
+            return _rpc_error(rpc_id, -32602, "unknown tool")
+        return _rpc_result(rpc_id, await tools.call(name, args))
+    return _rpc_error(rpc_id, -32601, "method not found")
 
 
-def create_app(token: str, desktop: Desktop | None = None) -> FastAPI:
+def create_app(token: str, desktop: Desktop | None = None,
+               workspace: str | None = None,
+               browser: Browser | None = None) -> FastAPI:
     if not token:
         raise ValueError("LOOM_COMPUTER_TOKEN must be a non-empty token")
-    app = FastAPI(title="Loom Computer", version=VERSION,
+    desktop = desktop or Desktop()
+    tools = Tools(guide, desktop,
+                  workspace or os.environ.get("LOOM_WORKSPACE", WORKSPACE), browser)
+
+    @contextlib.asynccontextmanager
+    async def lifespan(_app):
+        yield
+        tools.shutdown()  # no job outlives the API
+
+    app = FastAPI(title="Loom Computer", version=VERSION, lifespan=lifespan,
                   docs_url=None, redoc_url=None, openapi_url=None)
 
-    hub = FrameHub(desktop or Desktop())
+    hub = FrameHub(desktop)
     viewer_html, viewer_csp = _viewer_page()
 
     def token_ok(candidate: str | None) -> bool:
@@ -171,7 +170,7 @@ def create_app(token: str, desktop: Desktop | None = None) -> FastAPI:
 
     @app.post("/mcp")
     async def mcp(request: Request):
-        # Phase 0: the holder is recognized and logged, nothing more.
+        # The holder is recognized and logged, nothing more.
         log.debug("mcp request holder=%s", request.headers.get("x-computer-holder"))
         try:
             message = await request.json()
@@ -181,7 +180,7 @@ def create_app(token: str, desktop: Desktop | None = None) -> FastAPI:
             return JSONResponse(
                 _rpc_error(None, -32600, "invalid request: object required"),
                 status_code=400)
-        response = _handle_rpc(message)
+        response = await _handle_rpc(message, tools)
         if response is None:
             return JSONResponse(None, status_code=202)
         invalid = response.get("error", {}).get("code") == INVALID_REQUEST

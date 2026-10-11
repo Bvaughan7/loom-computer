@@ -72,9 +72,9 @@ def test_guide_matches_loom_parser_manifest(client):
     assert re.fullmatch(r"[0-9a-f]{64}", manifest["sha256"])
 
 
-def test_other_calls_not_implemented(client):
-    r = rpc(client, "tools/call", {"name": "shell", "arguments": {}})
-    assert r.json()["error"]["message"].startswith("not implemented")
+def test_unknown_method_is_method_not_found(client):
+    r = rpc(client, "resources/list")
+    assert r.json()["error"]["code"] == -32601
 
 
 def test_ws_rejects_bad_token_with_1008(client):

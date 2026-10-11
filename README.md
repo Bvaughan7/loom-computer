@@ -10,12 +10,12 @@ its own schedule; this skeleton is release line **0.10.3**, Loom's
 
 ## Contract summary
 
-Source of truth: Loom's `docs/computer.md`. Phases 0 and 1 implement:
+Source of truth: Loom's `docs/computer.md`. Phases 0-2 implement:
 
 | Route | Behavior |
 | --- | --- |
 | `GET /health` | Open liveness probe, `200 {"status":"ok","version":"0.10.3"}`. |
-| `POST /mcp` | Needs `Authorization: Bearer $LOOM_COMPUTER_TOKEN`, else JSON 401 for every method (as does every route other than `GET /health` and `GET /`). JSON-RPC body. `tools/call` `state` with `action: "guide"` returns the release skill (`name`, `version`, bare-hex `sha256` of `skill`, and the `skill` text); everything else is a JSON-RPC "not implemented" error. `initialize` and `tools/list` are answered minimally. |
+| `POST /mcp` | Needs `Authorization: Bearer $LOOM_COMPUTER_TOKEN`, else JSON 401 for every method (as does every route other than `GET /health` and `GET /`). JSON-RPC body. `tools/call` `state` with `action: "guide"` returns the release skill (`name`, `version`, bare-hex `sha256` of `skill`, and the `skill` text); the other tools are below. `initialize` and `tools/list` are answered. A tool that refuses or fails answers a result with `isError: true` and a text reason; an unknown tool is JSON-RPC `-32602`, an unknown method `-32601`. |
 | `X-Computer-Holder` | Names the teammate for leases and queued runs. Phase 0 only logs it at debug level. |
 | `GET /` | The viewer: a single page (no external assets, CSP-pinned inline script) that reads the token from the URL fragment, opens `/ws`, and draws frames on a canvas. |
 | `GET /ws` | Needs `?token=` matching the bearer. Bad token: accepted and closed with 1008 (so the peer sees the code). Good token: a text `{"type":"hello","width","height"}`, then binary JPEG frames, newest only, sent when the screen changed. The viewer sends **text only** (JSON; binary is closed with 1003): `{"t":"pointer","x","y","buttons"}` (DOM `buttons` bitmask), `{"t":"wheel","dy"}`, `{"t":"key","key","down"}` (DOM `key` values). Held keys/buttons are released when the socket closes. No X display: 1011. |
@@ -28,7 +28,38 @@ Nothing runs as root: the image uses the `agent` user (UID 1000) with
 `/home/agent/workspace` as its working directory.
 
 Not yet implemented: `PUT /secrets`, `/passkeys/registration`,
-`DELETE /logins/{name}`, and the MCP tools (browser/shell/files).
+`DELETE /logins/{name}`, `state login_load`, `GET /files/download`.
+
+## The tools (Phase 2)
+
+The agent learns these from the skill (`loom_computer/skill.md`), which `state guide`
+serves; that file is the reference. Summary:
+
+| Tool | Arguments | Answer |
+| --- | --- | --- |
+| `state` | `action: "guide"` | `name`, `version`, `sha256`, `skill`. Any other action: `state: unknown action <action>`. |
+| `shell` | exactly one of `command` (run by `bash -c`) or `argv` (list, no shell); `cwd`, `timeout` (default 120 s, max 3600) | JSON text: `exit_code`, `stdout`, `stderr`, `timed_out`, `truncated`, `duration_s`. |
+| `files` | `action` read / write / list / run; `path`; `content`, `encoding` (utf-8/base64), `append`; run: `args`, `cwd`, `timeout` | read/write/list JSON; run answers like `shell`. Confined to `/home/agent/workspace` (symlinks resolved first). |
+| `browser` | `action` navigate / title / text / fill / click; `url`, `selector`, `value` | JSON text. Drives the Phase 1 Chromium over CDP. |
+| `capture` | `mode` image (<= 1568 px longer edge) / png / tree; `window`, `region` `[x,y,w,h]` | `image`/`png`: an MCP image block plus a text note of the scale. `tree`: accessibility tree as text. |
+
+Design choices:
+
+- **Jobs.** Children of the API in their own session (so a timeout or
+  cancellation kills the whole tree); environment built from constants plus
+  `<workspace>/.loom/env` (`KEY=VALUE` lines) - never the API's environment,
+  which holds the bearer. When the command exits, leftovers in its process
+  group are killed; `setsid` opts out. Output keeps head and tail (96 KiB each).
+- **Shell string vs argv.** Both are offered and exactly one is required: a
+  string for pipelines, a list when an argument must not meet a shell.
+- **Browser over CDP, not X injection.** supervisord starts Chromium with
+  `--remote-debugging-port=9222` on loopback (not published; the page Host
+  and Origin checks keep web pages out). Each call attaches to the most
+  recently active page target, so the person's own tabs are what the agent sees.
+- **Capture** grabs the X root with `mss` (the same path as the viewer), crops
+  to the window geometry (EWMH client list; title or class substring, or a
+  1-based index) and then the region, and scales with Lanczos. `tree` is
+  `Accessibility.getFullAXTree`.
 
 ## The desktop (Phase 1)
 

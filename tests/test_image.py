@@ -9,6 +9,7 @@ import os
 import socket
 import subprocess
 import time
+import urllib.error
 import urllib.request
 
 import pytest
@@ -109,3 +110,132 @@ def test_screenshot_equivalent_over_ws(container):
 def test_missing_token_refuses_to_start():
     r = docker("run", "--rm", IMAGE, check=False)
     assert r.returncode != 0 and "LOOM_COMPUTER_TOKEN" in r.stderr
+
+
+# -- Phase 2: the tools, against the real desktop --------------------------------
+
+def mcp(port, name, arguments=None, token=TOKEN):
+    import json
+
+    body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                       "params": {"name": name, "arguments": arguments or {}}}).encode()
+    request = urllib.request.Request(
+        f"http://127.0.0.1:{port}/mcp", data=body, method="POST",
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"})
+    with urllib.request.urlopen(request, timeout=60) as response:
+        return json.loads(response.read())["result"]
+
+
+def tool(port, name, arguments=None):
+    """A tool's JSON answer (the first text block), failing on isError."""
+    import json
+
+    result = mcp(port, name, arguments)
+    assert result["isError"] is False, result
+    return json.loads(result["content"][0]["text"])
+
+
+PAGE = """<!doctype html><title>Loom Test Page</title>
+<h1>Welcome</h1>
+<input id="who" name="who" aria-label="Who">
+<button id="go" onclick="document.title = 'Hello ' + document.getElementById('who').value;
+  document.getElementById('out').textContent = 'clicked by ' + document.getElementById('who').value">Go</button>
+<p id="out">not clicked</p>"""
+
+
+def test_unauthenticated_tool_call_is_401(container):
+    _, port = container
+    with pytest.raises(urllib.error.HTTPError) as refused:
+        mcp(port, "shell", {"command": "echo hi"}, token="wrong")
+    assert refused.value.code == 401
+
+
+def test_shell_runs_as_agent_without_the_token(container):
+    _, port = container
+    assert tool(port, "shell", {"command": "echo hello"})["stdout"] == "hello\n"
+    assert tool(port, "shell", {"command": "id -un; pwd"})["stdout"] == \
+        "agent\n/home/agent/workspace\n"
+    env = tool(port, "shell", {"command": "env"})["stdout"]
+    assert "LOOM_COMPUTER_TOKEN" not in env and TOKEN not in env
+    environ = tool(port, "shell", {"command": "cat /proc/1/environ | wc -c"})
+    assert environ["stdout"].strip() == "0"  # PID 1 holds the token and is unreadable
+
+
+def test_files_round_trip_and_escape_refusal_in_the_image(container):
+    _, port = container
+    tool(port, "files", {"action": "write", "path": "t/in-image.txt", "content": "x"})
+    assert tool(port, "files", {"action": "read", "path": "t/in-image.txt"})["content"] == "x"
+    refused = mcp(port, "files", {"action": "read", "path": "../../../etc/passwd"})
+    assert refused["isError"] is True and "outside the workspace" in refused["content"][0]["text"]
+
+
+def wait_for_browser(port):
+    deadline = time.time() + 60
+    while True:
+        result = mcp(port, "browser", {"action": "title"})
+        if not result["isError"]:
+            return
+        assert time.time() < deadline, result
+        time.sleep(0.5)
+
+
+def test_browser_navigates_fills_and_clicks_a_local_page(container):
+    _, port = container
+    tool(port, "files", {"action": "write", "path": "page.html", "content": PAGE})
+    wait_for_browser(port)
+
+    page = tool(port, "browser", {"action": "navigate",
+                                  "url": "file:///home/agent/workspace/page.html"})
+    assert page["title"] == "Loom Test Page" and page["loaded"] is True
+    assert tool(port, "browser", {"action": "title"})["title"] == "Loom Test Page"
+    assert "Welcome" in tool(port, "browser", {"action": "text"})["text"]
+
+    tool(port, "browser", {"action": "fill", "selector": "#who", "value": "Ada Lovelace"})
+    tool(port, "browser", {"action": "click", "selector": "#go"})
+    assert tool(port, "browser", {"action": "title"})["title"] == "Hello Ada Lovelace"
+    assert tool(port, "browser", {"action": "text", "selector": "#out"})["text"] == \
+        "clicked by Ada Lovelace"
+    missing = mcp(port, "browser", {"action": "click", "selector": "#nope"})
+    assert missing["isError"] is True and "no element" in missing["content"][0]["text"]
+
+
+def test_capture_modes_against_the_real_desktop(container):
+    import base64
+    import json
+
+    from PIL import Image
+
+    _, port = container
+    tool(port, "files", {"action": "write", "path": "page.html", "content": PAGE})
+    wait_for_browser(port)
+    tool(port, "browser", {"action": "navigate",
+                           "url": "file:///home/agent/workspace/page.html"})
+
+    def picture(arguments):
+        result = mcp(port, "capture", arguments)
+        assert result["isError"] is False, result
+        block = result["content"][0]
+        assert block["type"] == "image" and block["mimeType"] == "image/png"
+        return Image.open(io.BytesIO(base64.b64decode(block["data"])))
+
+    shot = picture({"mode": "image"})
+    assert max(shot.size) <= 1568 and shot.size == (1280, 800)
+    assert len(set(shot.convert("L").resize((64, 40)).getdata())) > 3
+    assert picture({"mode": "png"}).size == (1280, 800)
+    assert picture({"mode": "image", "region": [0, 0, 300, 200]}).size == (300, 200)
+    window = picture({"mode": "png", "window": "chromium"})
+    assert window.size[0] > 400 and window.size[1] > 300
+
+    tree = mcp(port, "capture", {"mode": "tree"})
+    assert tree["isError"] is False
+    text = tree["content"][0]["text"]
+    assert "Loom Test Page" in text and 'heading "Welcome"' in text and "textbox" in text
+    state = mcp(port, "state", {"action": "guide"})
+    assert json.loads(state["content"][0]["text"])["skill"].count("capture") > 3
+
+
+def test_a_timed_out_job_is_killed_in_the_image(container):
+    name, port = container
+    result = tool(port, "shell", {"command": "sleep 300", "timeout": 1})
+    assert result["timed_out"] is True
+    assert docker("exec", name, "pgrep", "-x", "sleep", check=False).returncode != 0

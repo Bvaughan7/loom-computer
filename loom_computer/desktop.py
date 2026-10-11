@@ -12,6 +12,8 @@ import logging
 import os
 from concurrent.futures import ThreadPoolExecutor
 
+from .errors import ToolError
+
 log = logging.getLogger("loom_computer.desktop")
 
 FPS = 10
@@ -99,12 +101,87 @@ class Desktop:
                 pass
         self._grabber = self._xdisplay = None
 
+    def _windows(self) -> list[dict]:
+        """Top-level application windows, in stacking order, with their screen
+        geometry: the window manager's client list, or, with none running,
+        the viewable children of the root."""
+        from Xlib import X, Xatom
+
+        d = self._x()
+        root = d.screen().root
+        listed = root.get_full_property(d.intern_atom("_NET_CLIENT_LIST"), X.AnyPropertyType)
+        if listed is not None:
+            candidates = [d.create_resource_object("window", w) for w in listed.value]
+        else:
+            candidates = [w for w in root.query_tree().children
+                          if w.get_attributes().map_state == X.IsViewable]
+        net_name = d.intern_atom("_NET_WM_NAME")
+        found = []
+        for window in candidates:
+            try:
+                prop = window.get_full_property(net_name, X.AnyPropertyType)
+                title = (bytes(prop.value).decode("utf-8", "replace") if prop is not None
+                         else window.get_full_property(Xatom.WM_NAME, X.AnyPropertyType))
+                if title is not None and not isinstance(title, str):
+                    title = bytes(title.value).decode("latin-1")
+                klass = window.get_wm_class() or ()
+                geometry = window.get_geometry()
+                origin = root.translate_coords(window, 0, 0)
+            except Exception:  # noqa: BLE001 - the window vanished under us
+                continue
+            found.append({"title": title or "", "class": " ".join(klass),
+                          "x": origin.x, "y": origin.y,
+                          "width": geometry.width, "height": geometry.height})
+        return found
+
+    def _capture(self, window, region, max_edge) -> tuple[bytes, tuple, tuple]:
+        """(PNG, source size, output size) of the screen, a window, or a region."""
+        from PIL import Image
+
+        width, height, bgra = self._grab()
+        image = Image.frombuffer("RGB", (width, height), bgra, "raw", "BGRX", 0, 1)
+        left, top, right, bottom = 0, 0, width, height
+        if window is not None:
+            windows = self._windows()
+            wanted = window.strip().lower()
+            if wanted.isdigit() and 1 <= int(wanted) <= len(windows):
+                chosen = windows[int(wanted) - 1]
+            else:
+                chosen = next((w for w in windows if wanted and (
+                    wanted in w["title"].lower() or wanted in w["class"].lower())), None)
+            if chosen is None:
+                names = ", ".join(f'{i} "{w["title"]}"' for i, w in enumerate(windows, 1))
+                raise ToolError(f"no window is {window!r}; the windows are "
+                                + (names or "none"))
+            left, top = max(chosen["x"], 0), max(chosen["y"], 0)
+            right = min(chosen["x"] + chosen["width"], width)
+            bottom = min(chosen["y"] + chosen["height"], height)
+        if region is not None:
+            x, y, w, h = region
+            left, top, right, bottom = (
+                max(left + x, left), max(top + y, top),
+                min(left + x + w, right), min(top + y + h, bottom))
+        if right <= left or bottom <= top:
+            raise ToolError("the requested window or region is outside the screen")
+        if (left, top, right, bottom) != (0, 0, width, height):
+            image = image.crop((left, top, right, bottom))
+        source = image.size
+        if max_edge and max(source) > max_edge:
+            scale = max_edge / max(source)
+            image = image.resize((max(1, round(source[0] * scale)),
+                                  max(1, round(source[1] * scale))), Image.LANCZOS)
+        out = io.BytesIO()
+        image.save(out, "PNG")
+        return out.getvalue(), source, image.size
+
     # -- asyncio side ------------------------------------------------------
 
     async def _run(self, fn, *args):
         loop = asyncio.get_running_loop()
         try:
             return await loop.run_in_executor(self._pool, fn, *args)
+        except ToolError:
+            raise
         except Exception:
             # Reconnect on the next call (X restarted, display not up yet).
             await loop.run_in_executor(self._pool, self._drop)
@@ -116,6 +193,12 @@ class Desktop:
         digest = hashlib.blake2b(bgra, digest_size=16).digest()
         jpeg = await self._run(_encode, width, height, bgra)
         return width, height, jpeg, digest
+
+    async def capture(self, window=None, region=None, max_edge=None):
+        """(PNG bytes, source size, output size); `window` is a 1-based index
+        or a case-insensitive part of a title or WM class, `region` is
+        [x, y, w, h] within the window (or the screen)."""
+        return await self._run(self._capture, window, region, max_edge)
 
     async def keycode(self, keysym: int) -> int | None:
         return await self._run(self._keycode, keysym) or None
