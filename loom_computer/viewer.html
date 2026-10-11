@@ -101,12 +101,16 @@ html, body { margin: 0; height: 100%; background: #111; overflow: hidden; }
     send({ t: "key", key: name, down: false });
   }
 
-  function releaseAll() {
-    Object.keys(held).forEach(releaseKey);
+  function releaseButtons() {
     if (buttons) {
       buttons = 0;
       send({ t: "pointer", x: lastX, y: lastY, buttons: 0 });
     }
+  }
+
+  function releaseAll() {
+    Object.keys(held).forEach(releaseKey);
+    releaseButtons();
   }
 
   canvas.addEventListener("keydown", function (event) {
@@ -128,8 +132,10 @@ html, body { margin: 0; height: 100%; background: #111; overflow: hidden; }
   document.addEventListener("visibilitychange", function () {
     if (document.hidden) releaseAll();
   });
-  canvas.addEventListener("pointercancel", pointer);
-  canvas.addEventListener("lostpointercapture", pointer);
+  // event.buttons can't be trusted once capture ends with a button still
+  // down (no pointerup may follow), so let go of everything held.
+  canvas.addEventListener("pointercancel", releaseButtons);
+  canvas.addEventListener("lostpointercapture", releaseButtons);
 
   connect();
 })();
