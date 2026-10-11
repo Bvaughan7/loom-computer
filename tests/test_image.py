@@ -267,6 +267,27 @@ navigator.credentials.get({publicKey: {challenge: new Uint8Array(32), rpId: 'loc
         e => document.getElementById('out').textContent = 'error ' + e.name);
 </script>""" % P3_CRED
 
+P3_CREATE_PAGE = """<!doctype html><title>create</title><p id="out">creating</p>
+<script>
+const out = t => document.getElementById('out').textContent = t;
+navigator.credentials.create({publicKey: {challenge: new Uint8Array(32),
+  rp: {id: 'localhost', name: 'Smoke Site'},
+  user: {id: new Uint8Array([1, 2, 3]), name: 'alice', displayName: 'Alice'},
+  pubKeyCredParams: [{type: 'public-key', alg: -7}],
+  authenticatorSelection: {residentKey: 'required', userVerification: 'preferred'}}})
+  .then(c => navigator.credentials.get({publicKey: {challenge: new Uint8Array(32),
+          rpId: 'localhost', allowCredentials: [{type: 'public-key', id: c.rawId}],
+          userVerification: 'preferred', timeout: 20000}})
+        .then(a => out('created and got ' + a.type), e => out('created, get ' + e.name)),
+        e => out('create ' + e.name));
+</script>"""
+
+# a page that navigates itself to the passkey page: its get() runs at load, with
+# no look from the tools in between
+P3_HOP_PAGE = """<!doctype html><title>hop</title><p id="out">pending</p>
+<script>setTimeout(() => location.href = '/passkey.html?hop', 300)</script>"""
+
+
 def http_json(port, method, path, body=None):
     import json
 
@@ -314,7 +335,8 @@ def test_phase3_secrets_in_the_real_container(container):
                      f"grep -rl {P3_VALUE} /home/agent /tmp 2>/dev/null | wc -l").stdout.strip()
     assert on_disk == "0"
 
-    for path, content in (("login.html", P3_LOGIN_PAGE), ("passkey.html", P3_PASSKEY_PAGE)):
+    for path, content in (("login.html", P3_LOGIN_PAGE), ("passkey.html", P3_PASSKEY_PAGE),
+                          ("create.html", P3_CREATE_PAGE), ("hop.html", P3_HOP_PAGE)):
         tool(port, "files", {"action": "write", "path": f"site/{path}", "content": content})
     tool(port, "shell", {"command": "setsid -f python3 -m http.server 8099 --bind 127.0.0.1 "
                          "--directory /home/agent/workspace/site >/dev/null 2>&1 </dev/null"})
@@ -335,6 +357,15 @@ def test_phase3_secrets_in_the_real_container(container):
     # passkey: the site's get() is answered by the virtual authenticator
     tool(port, "browser", {"action": "navigate", "url": "http://localhost:8099/passkey.html"})
     assert page_text(port, until=lambda t: t != "pending").startswith("got public-key")
+
+    # a navigation the page makes itself: get() at load finds the authenticator
+    tool(port, "browser", {"action": "navigate", "url": "http://localhost:8099/hop.html"})
+    time.sleep(1.5)
+    assert page_text(port, until=lambda t: t != "pending").startswith("got public-key")
+
+    # nothing mints a passkey: create() is refused, and no get() can follow it
+    tool(port, "browser", {"action": "navigate", "url": "http://localhost:8099/create.html"})
+    assert page_text(port, until=lambda t: t != "creating") == "create NotAllowedError"
 
     # the whole container logged none of it
     logs = docker("logs", name)

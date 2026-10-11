@@ -109,7 +109,13 @@ Design:
   removes a dropped passkey. The showing tab is brought to front when its
   page has no focus, because a WebAuthn ceremony waits for a focused page.
   Nothing mints a passkey: only sign-in (`navigator.credentials.get()`) with
-  a granted passkey is answered.
+  a granted passkey is answered. Two server-side holds keep it so, with no
+  script in the page: the DevTools Fetch domain pauses every document
+  response, attaches the tab's authenticator and loads the granted set
+  before releasing it (the sign-in readiness hold, so a `get()` at load
+  finds it), and releases it with `Permissions-Policy:
+  publickey-credentials-create=()` so `create()` is refused by the browser.
+  A tab on `about:blank` holds no authenticator until a real document loads.
 
 ## Held for redesign: passkey registration
 
@@ -133,12 +139,9 @@ in the way:
    lets an evicted one be replayed and the single-use guarantee breaks.
 
 Until the ceremony returns, a passkey reaches the computer only as a granted
-`PUT /secrets` record. The sign-in hold that rode on the same page script
-(a `get()` held until the document loaded and the authenticator survived a
-navigation) went with it; the watcher re-attaches the authenticator every
-second instead. The fake-DevTools tests cover loading and cleanup, but the
-real-Chromium navigation race that hold papered over is not re-verified here
-(`tests/test_image.py` needs docker).
+`PUT /secrets` record, and `create()` is refused outright (see *Passkeys*
+above); `tests/test_image.py` covers create-then-immediate-get and a
+page-driven navigation's `get()` at load against real Chromium.
 
 `state login_load` is still unimplemented: the contract names it with no
 defined shape, and this release does not invent one.

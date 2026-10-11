@@ -9,7 +9,19 @@ Every look makes the authenticator hold exactly the granted set: a credential
 that appears there and was not granted is removed, on its event and on every
 look.
 
-There is no registration: nothing here mints a passkey.
+There is no registration: nothing here mints a passkey. Two things hold that
+line, both server-side, neither a script in the page:
+
+* Every document the tab loads is answered with
+  `Permissions-Policy: publickey-credentials-create=()` (the DevTools Fetch
+  domain adds it to the response), so `navigator.credentials.create()` is
+  refused by the browser before any authenticator hears of it. Removing a
+  credential that appeared is only the backstop for what slips past.
+* The same pause is the sign-in readiness hold: a document's response is not
+  released until the tab's authenticator is attached and holds the granted
+  set, so a page's `credentials.get()` at load always finds it. A tab sitting
+  on `about:blank` has no authenticator at all, so nothing there can create or
+  sign.
 """
 
 import asyncio
@@ -24,6 +36,7 @@ log = logging.getLogger("loom_computer")
 
 POLL_SECONDS = 1.0
 CALL_TIMEOUT = 10.0
+NO_CREATE = "publickey-credentials-create=()"
 
 
 class _Conn:
@@ -82,6 +95,11 @@ class _Tab:
     reader: asyncio.Task | None = None
     background: set = field(default_factory=set)
     closed: bool = False
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)  # one set-up at a time
+
+
+def _is_blank(url: str) -> bool:
+    return url == "" or url.startswith("about:")
 
 
 class Passkeys:
@@ -170,9 +188,14 @@ class Passkeys:
         tab.reader = asyncio.ensure_future(tab.conn.run())
         tab.reader.add_done_callback(lambda _t: setattr(tab, "closed", True))
         try:
-            await self._setup_authenticator(tab, load=False)
+            await tab.conn.call("Page.enable")
+            await tab.conn.call("Fetch.enable", {"patterns": [
+                {"resourceType": "Document", "requestStage": "Response"}]})
+            if not _is_blank(page.get("url", "")):
+                await self._setup_authenticator(tab, load=False)
             self._tabs[tab.target] = tab
-            await self._sync(tab)
+            if tab.authenticator:
+                await self._sync(tab)
         except BaseException:
             self._tabs.pop(tab.target, None)
             await self._close_tab(tab)
@@ -195,25 +218,35 @@ class Passkeys:
         if load:
             await self._sync(tab)
 
-    async def _ensure(self, tab: _Tab) -> None:
-        """The tab can answer a sign-in right now, and its page is focused.
+    async def _attached(self, tab: _Tab) -> None:
+        """The tab can answer a sign-in right now: its authenticator is there
+        and holds the granted set.
 
         Right after a navigation commits the domain can be reset once more
         behind our back, so a failed look is retried a few times."""
-        for attempt in range(8):
-            try:
-                await tab.conn.call("WebAuthn.getCredentials",
-                                    {"authenticatorId": tab.authenticator})
-                break
-            except RuntimeError as exc:
-                log.debug("authenticator look %d failed: %s", attempt, exc)
+        async with tab.lock:
+            for attempt in range(8):
                 try:
-                    await self._setup_authenticator(tab)
-                    log.debug("authenticator set up again")
-                    break
-                except RuntimeError as again:
-                    log.debug("set up failed: %s", again)
+                    if not tab.authenticator:
+                        await self._setup_authenticator(tab)
+                    else:
+                        await tab.conn.call("WebAuthn.getCredentials",
+                                            {"authenticatorId": tab.authenticator})
+                    return
+                except RuntimeError as exc:
+                    log.debug("authenticator look %d failed: %s", attempt, exc)
+                    if tab.authenticator:
+                        try:
+                            await self._setup_authenticator(tab)
+                            log.debug("authenticator set up again")
+                            return
+                        except RuntimeError as again:
+                            log.debug("set up failed: %s", again)
                     await asyncio.sleep(0.25)
+
+    async def _ensure(self, tab: _Tab) -> None:
+        """Attached, and the page is focused."""
+        await self._attached(tab)
         await self._focus(tab)
 
     async def _close_tab(self, tab: _Tab) -> None:
@@ -268,8 +301,8 @@ class Passkeys:
     async def _tick(self) -> None:
         wanted = bool(self._store.passkeys)
         for tab in list(self._tabs.values()):
-            if tab.closed:
-                continue
+            if tab.closed or not tab.authenticator:
+                continue  # a blank tab has none; its next document attaches one
             try:
                 if wanted:
                     await self._ensure(tab)
@@ -281,12 +314,54 @@ class Passkeys:
     # -- events from a tab ----------------------------------------------------
 
     def _event(self, tab: _Tab, message: dict) -> None:
-        if message.get("method") != "WebAuthn.credentialAdded":
+        method, params = message.get("method"), message.get("params", {})
+        if method == "WebAuthn.credentialAdded":
+            work = self._on_credential(tab, params.get("credential", {}))
+        elif method == "Fetch.requestPaused":
+            work = self._release(tab, params)
+        elif (method == "Page.frameNavigated" and not params.get("frame", {}).get("parentId")
+              and _is_blank(params.get("frame", {}).get("url", ""))):
+            work = self._detach(tab)
+        else:
             return
-        task = asyncio.ensure_future(
-            self._on_credential(tab, message.get("params", {}).get("credential", {})))
+        task = asyncio.ensure_future(work)
         tab.background.add(task)
         task.add_done_callback(tab.background.discard)
+
+    async def _release(self, tab: _Tab, params: dict) -> None:
+        """A document's response, held: attach the authenticator, forbid
+        create(), let the document go."""
+        ident = params["requestId"]
+        try:
+            if "responseStatusCode" not in params or params.get("responseErrorReason"):
+                await tab.conn.call("Fetch.continueRequest", {"requestId": ident})
+                return
+            await self._attached(tab)
+            # last, so it wins over a site's own value for this one feature
+            headers = list(params.get("responseHeaders", [])) + [
+                {"name": "Permissions-Policy", "value": NO_CREATE}]
+            await tab.conn.call("Fetch.continueResponse", {
+                "requestId": ident, "responseCode": params["responseStatusCode"],
+                "responseHeaders": headers})
+        except Exception:  # noqa: BLE001 - never let a document through unguarded
+            log.debug("could not release a held document", exc_info=True)
+            try:
+                await tab.conn.call("Fetch.failRequest", {
+                    "requestId": ident, "errorReason": "BlockedByClient"})
+            except Exception:  # noqa: BLE001
+                pass
+
+    async def _detach(self, tab: _Tab) -> None:
+        """The tab went to a blank document, which no response header guards:
+        it keeps no authenticator until a real document loads."""
+        async with tab.lock:
+            gone, tab.authenticator = tab.authenticator, ""
+            if gone:
+                try:
+                    await tab.conn.call("WebAuthn.removeVirtualAuthenticator",
+                                        {"authenticatorId": gone})
+                except Exception:  # noqa: BLE001
+                    pass
 
     async def _on_credential(self, tab: _Tab, credential: dict) -> None:
         try:
