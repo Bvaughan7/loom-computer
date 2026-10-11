@@ -236,6 +236,11 @@ class Tools:
                 data = self.secrets.redact_bytes(base64.b64decode(got["content"]))
                 got = {**got, "bytes": len(data),
                        "content": base64.b64encode(data).decode("ascii")}
+                # byte-level masking is complete for this content; the text
+                # redactor is skipped so the base64 stays valid
+                res = text_result(got)
+                res["_loom_bytes_masked"] = True
+                return res
             return self._text(got)
         if action == "write":
             append = args.get("append", False)

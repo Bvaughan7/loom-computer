@@ -299,6 +299,12 @@ class SecretStore:
     def redact_result(self, result: dict) -> dict:
         """An MCP result with every secret masked in its text and structured
         content. Image blocks are pixels and pass as they are."""
+        # Byte-level masking already removed every value's bytes from this
+        # answer; a text pass would only corrupt its encoding (re-masking
+        # characters inside base64("[REDACTED]")). The flag is private and
+        # never leaves here: Tools.call routes every answer through this.
+        if result.pop("_loom_bytes_masked", False):
+            return result
         if not self._needles:
             return result
         out = dict(result)

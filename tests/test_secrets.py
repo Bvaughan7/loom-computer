@@ -328,6 +328,18 @@ def test_base64_read_of_clean_binary_round_trips(client, workspace):
     assert base64.b64decode(got["content"]) == data and got["bytes"] == 512
 
 
+def test_base64_read_with_short_value_stays_valid_base64(client, workspace):
+    put_secrets(client, {"SHORT": "D", "SITE": LOGIN})
+    (workspace / "d.bin").write_bytes(b"\x00\x01filler" + b"D" + b"\xfe\xffmore\x02")
+    got = answer(call(client, "files", {"action": "read", "path": "d.bin",
+                                        "encoding": "base64"}))
+    raw = base64.b64decode(got["content"], validate=True)
+    assert got["bytes"] == len(raw)
+    # the mask spells "RED" with a D itself, so look past it for the value
+    assert raw == b"\x00\x01filler[REDACTED]\xfe\xffmore\x02"
+    assert b"D" not in raw.replace(b"[REDACTED]", b"")
+
+
 def test_malformed_set_errors_name_the_secret(client):
     bad_site = {"kind": "login", "sites": ["not a host!"], "username": "u", "password": "p"}
     r = put_secrets(client, {"SITEY": bad_site})
