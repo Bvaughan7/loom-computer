@@ -52,6 +52,7 @@ class FakeCDP:
         self.credentials: dict[int, dict[str, dict]] = {}
         self.sockets: dict[int, object] = {}
         self.bindings: dict[int, list] = {}
+        self.page_text = ""  # what `browser text` finds on every page
         self._ready = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
 
@@ -127,6 +128,8 @@ class FakeCDP:
                     value = {"filled": "input"}
             elif "__loomRelease" in expression:
                 value = True
+            elif "el.innerText" in expression:
+                value = {"text": self.page_text}
             else:
                 value = None
             return {"result": {"value": value}}
@@ -153,10 +156,10 @@ class FakeCDP:
                 out.append(json.loads(params["expression"].rsplit(", ", 1)[1].rstrip(")")))
         return out
 
-    def mint(self, index, rp_id="example.com", ident=b"minted-credential"):
+    def mint(self, index, rp_id="example.com", ident=b"minted-credential", handle=HANDLE):
         credential = {"credentialId": base64.b64encode(ident).decode(), "rpId": rp_id,
                       "isResidentCredential": True, "privateKey": KEY,
-                      "userHandle": HANDLE, "signCount": 0}
+                      "userHandle": handle, "signCount": 0}
         self.credentials[index][credential["credentialId"]] = credential
         self.event(index, "WebAuthn.credentialAdded",
                    {"authenticatorId": f"auth{index}", "credential": credential})
@@ -338,6 +341,71 @@ def test_redaction_masks_json_escaped_forms(client):
     assert answer(out)["stdout"] == "[REDACTED]"
     # the text block is JSON, so it carries the escaped form: masked too
     assert "quo" not in out["content"][0]["text"] and "back" not in out["content"][0]["text"]
+
+
+def test_redaction_masks_every_json_escape_form(client, workspace):
+    # json.dumps writes these as \u00e9, \u2603, \u0000, \b, \f, \u001f ...
+    tricky = "pre\u0000\b\f\u001f\u00e9\u2603\U0001F600post"
+    (workspace / "t.txt").write_text(tricky, encoding="utf-8")
+    put_secrets(client, {"T": tricky, "U": "caf\u00e9-\u2603-\x01\x1b-end"})
+    results = [
+        call(client, "files", {"action": "read", "path": "t.txt"}),
+        call(client, "shell", {"command": "printf %s \"$U\"; printf %s \"$U\" >&2"}),
+        call(client, "files", {"action": "read", "path": "../" + "x" * 3 + tricky}),
+        call(client, "shell", {"command": "echo hi", "cwd": tricky}),
+    ]
+    for result in results:
+        blob = json.dumps(result) + result["content"][0]["text"]
+        for piece in ("\\u0000", "\\b", "\\f", "\\u001f", "\\u00e9", "\\u2603",
+                      "\\u0001", "\\u001b", "post", "-end", "caf"):
+            assert piece not in blob, (piece, blob)
+        assert "pre" not in result["content"][0]["text"].replace("[REDACTED]", "")
+    assert "[REDACTED]" in results[0]["content"][0]["text"]
+    assert answer(results[1])["stdout"] == "[REDACTED]"
+
+
+# -- revocation and short-lived values ---------------------------------------------
+
+def test_a_replaced_value_stays_masked_for_the_job_that_holds_it(client, workspace):
+    put_secrets(client, {"OLD": VAR_VALUE})
+    out = {}
+
+    def run():
+        out["result"] = call(client, "shell", {
+            "command": "touch started; while [ ! -e go ]; do sleep 0.05; done; "
+                       "printf %s \"$OLD\"; printf %s \"$OLD\" >&2"})
+    job = threading.Thread(target=run)
+    job.start()
+    assert wait_for(lambda: (workspace / "started").exists())
+    put_secrets(client, {})  # the value is revoked while the job still holds it
+    (workspace / "go").write_text("")
+    job.join(10)
+    result = answer(out["result"])
+    assert result["stdout"] == "[REDACTED]" and result["stderr"] == "[REDACTED]"
+    assert VAR_VALUE not in json.dumps(out["result"])
+    # and once no job holds it, the mask is gone with the value
+    assert answer(call(client, "shell", {"command": "echo " + VAR_VALUE}))["stdout"] \
+        == VAR_VALUE + "\n"
+
+
+def test_a_generated_totp_code_is_masked_on_the_page(make):
+    fake, client = make(["https://example.com"])
+    put_secrets(client, {"L": {**LOGIN, "totp": "JBSWY3DPEHPK3PXP"}})
+    answer(call(client, "browser", {"action": "fill", "selector": "#c",
+                                    "secret": "L", "field": "totp"}))
+    code = json.loads(fake.fills[0].rsplit(", ", 2)[1])
+    fake.page_text = f"We saw the code {code} in the field"
+    shown = call(client, "browser", {"action": "text"})
+    assert code not in json.dumps(shown)
+    assert answer(shown)["text"] == "We saw the code [REDACTED] in the field"
+
+
+def test_a_timed_mask_expires():
+    store = SecretStore()
+    store.remember_for("123456", 0.05)
+    assert store.redact("code 123456") == "code [REDACTED]"
+    time.sleep(0.1)
+    assert store.redact("code 123456") == "code 123456"
 
 
 # -- in memory only -------------------------------------------------------------
@@ -688,6 +756,55 @@ def test_a_credential_for_another_site_after_approval_is_removed(make):
         assert status(client)["status"] == "approved"
 
 
+def _approve(client, fake, **ask):
+    arm(client)
+    assert wait_for(lambda: 0 in fake.sockets)
+    fake.page_calls_create(0, rpId="example.com", **ask)
+    assert wait_for(lambda: status(client)["status"] == "asked")
+    client.post("/passkeys/registration/answer", headers=AUTH,
+                content=json.dumps({"id": status(client)["ask"]["id"], "approved": True}))
+    assert wait_for(lambda: status(client)["status"] == "approved")
+
+
+OTHER_HANDLE = base64.b64encode(b"someone-else").decode()
+
+
+def test_a_second_credential_while_approved_is_removed_and_not_reported(make):
+    fake, client = make(["https://example.com"])
+    with client:
+        _approve(client, fake, userId=HANDLE)
+        stray = fake.mint(0, ident=b"stray-credential", handle=OTHER_HANDLE)
+        assert wait_for(lambda: stray["credentialId"] not in fake.credentials[0])
+        assert status(client)["status"] == "approved"
+        minted = fake.mint(0, ident=b"the-real-credential")
+        assert wait_for(lambda: status(client)["status"] == "registered")
+        assert status(client)["passkey"]["credentialId"] == minted["credentialId"]
+        assert minted["credentialId"] in fake.credentials[0]
+
+
+def test_a_credential_after_the_approved_one_is_removed(make):
+    fake, client = make(["https://example.com"])
+    with client:
+        _approve(client, fake, userId=HANDLE)
+        minted = fake.mint(0, ident=b"the-real-credential")
+        assert wait_for(lambda: status(client)["status"] == "registered")
+        late = fake.mint(0, ident=b"late-credential", handle=OTHER_HANDLE)
+        assert wait_for(lambda: late["credentialId"] not in fake.credentials[0])
+        assert status(client)["passkey"]["credentialId"] == minted["credentialId"]
+
+
+def test_a_look_during_approval_removes_an_unrelated_credential(make):
+    fake, client = make(["https://example.com"])
+    with client:
+        _approve(client, fake, userId=HANDLE)
+        stray = {"credentialId": base64.b64encode(b"planted").decode(),
+                 "rpId": "example.com", "isResidentCredential": True,
+                 "privateKey": KEY, "userHandle": OTHER_HANDLE, "signCount": 0}
+        fake.credentials[0][stray["credentialId"]] = stray  # no event: only a look finds it
+        assert wait_for(lambda: stray["credentialId"] not in fake.credentials[0], 6)
+        assert status(client)["status"] == "approved"
+
+
 def test_minted_key_is_redacted_from_tool_output(make, workspace):
     fake, client = make(["https://example.com"])
     with client:
@@ -712,3 +829,25 @@ def test_store_rejects_without_echo():
         store.replace({"X": {"kind": "login", "sites": ["a.com"],
                              "username": "u-secret", "password": ""}})
     assert "u-secret" not in str(raised.value)
+
+
+# -- /files/download masks granted values -----------------------------------------
+
+def test_download_masks_a_granted_value(client, workspace):
+    put_secrets(client, {"V": VAR_VALUE})
+    pad = b"." * (65536 - 7)  # the value straddles the first chunk boundary
+    (workspace / "big.bin").write_bytes(pad + VAR_VALUE.encode() + b"\x00tail")
+    r = client.get("/files/download", params={"path": "big.bin"}, headers=AUTH)
+    assert r.status_code == 200
+    assert VAR_VALUE.encode() not in r.content
+    assert r.content == pad + b"[REDACTED]\x00tail"
+    cut = client.get("/files/download", params={"path": "big.bin", "max_bytes": "5"},
+                     headers=AUTH)
+    assert cut.content == b"....."
+
+
+def test_download_is_unchanged_without_a_matching_value(client, workspace):
+    put_secrets(client, {"V": VAR_VALUE})
+    (workspace / "plain.bin").write_bytes(b"\x00\x01 nothing here")
+    r = client.get("/files/download", params={"path": "plain.bin"}, headers=AUTH)
+    assert r.content == b"\x00\x01 nothing here"

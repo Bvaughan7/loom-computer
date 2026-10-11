@@ -10,10 +10,11 @@ simply what the next call finds.
 import asyncio
 import json
 import os
+import time
 import urllib.request
 
 from .errors import ToolError
-from .secrets import site_allows
+from .secrets import site_allows, totp_lifetime
 
 DEFAULT_ENDPOINT = "http://127.0.0.1:9222"
 NAVIGATE_TIMEOUT = 30.0
@@ -241,7 +242,7 @@ class Browser:
             return await page.evaluate(_FILL, selector, value)
         return await self._with_page(work)
 
-    async def fill_secret(self, selector, login, field: str) -> dict:
+    async def fill_secret(self, selector, login, field: str, remember=None) -> dict:
         """Type one field of a saved login, only on a page of its own sites."""
         _check_selector(selector)
         if field not in ("username", "password", "totp"):
@@ -256,7 +257,10 @@ class Browser:
             value = {"username": login.username, "password": login.password,
                      "totp": login.totp_code if field == "totp" else None}[field]
             if field == "totp":
-                value = value()
+                now = time.time()
+                value = login.totp_code(now)
+                if remember is not None:  # masked before it is typed anywhere
+                    remember(value, totp_lifetime(now))
             result = await page.evaluate(_FILL_AT, selector, value, origin)
             return {**result, "field": field}
         return await self._with_page(work)

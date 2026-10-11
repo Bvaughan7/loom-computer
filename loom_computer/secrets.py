@@ -1,8 +1,10 @@
-"""The granted secret set: held in memory only, never answered back.
+"""The granted secret set: this store holds it in memory only and never
+answers it back.
 
 `PUT /secrets` replaces the whole set. Nothing here writes to disk, logs a
 value, or echoes one in an error: a refusal names the secret and the shape
-that was wrong, never what it held.
+that was wrong, never what it held. (What a job does with its own environment,
+and what the browser profile keeps, is outside this store.)
 """
 
 import base64
@@ -64,6 +66,12 @@ class Passkey:
     @property
     def key(self) -> bytes:
         return b64_bytes(self.credential_id)
+
+
+def totp_lifetime(now: float, step: int = 30, margin: int = 10) -> float:
+    """Seconds a code made at `now` should stay masked: the rest of its step
+    and a margin for a site that is slow to echo it."""
+    return step - (now % step) + margin
 
 
 def totp_code(secret: str, now: float, digits: int = 6, step: int = 30) -> str:
@@ -155,6 +163,13 @@ class SecretStore:
         self._needles: list[tuple[str, str]] = []
         self._listeners: list = []
         self.extra: set[str] = set()  # minted-but-not-yet-delivered values to redact
+        # Values a live job still holds in its environment after the set was
+        # replaced: masked until that job ends. lease id -> values.
+        self._held: dict[int, frozenset[str]] = {}
+        self._lease_ids = 0
+        # Short-lived values (a generated TOTP code): value -> monotonic expiry.
+        self._timed: dict[str, float] = {}
+        self._next_expiry = float("inf")
 
     # -- loading --------------------------------------------------------------
 
@@ -228,7 +243,9 @@ class SecretStore:
     # -- redaction ------------------------------------------------------------
 
     def _values(self) -> set[str]:
-        values = set(self.variables.values()) | self.extra
+        values = set(self.variables.values()) | self.extra | set(self._timed)
+        for held in self._held.values():
+            values |= held
         for login in self.logins.values():
             values.update((login.username, login.password))
             if login.totp:
@@ -254,7 +271,42 @@ class SecretStore:
         self.extra.add(value)
         self._rebuild()
 
+    def hold(self, values) -> int:
+        """Keep `values` masked until `release(lease)`, whatever replaces the
+        set meanwhile: a running job still has them in its environment."""
+        self._lease_ids += 1
+        self._held[self._lease_ids] = frozenset(v for v in values if v)
+        self._rebuild()
+        return self._lease_ids
+
+    def release(self, lease: int) -> None:
+        if self._held.pop(lease, None) is not None:
+            self._rebuild()
+
+    def remember_for(self, value: str, seconds: float) -> None:
+        """Mask a generated value (a TOTP code) for `seconds` from now."""
+        if not value:
+            return
+        expiry = time.monotonic() + seconds
+        self._timed[value] = max(expiry, self._timed.get(value, 0.0))
+        self._next_expiry = min(self._next_expiry, self._timed[value])
+        self._rebuild()
+
+    def _prune(self) -> None:
+        if self._next_expiry == float("inf") or time.monotonic() < self._next_expiry:
+            return
+        now = time.monotonic()
+        self._timed = {v: t for v, t in self._timed.items() if t > now}
+        self._next_expiry = min(self._timed.values(), default=float("inf"))
+        self._rebuild()
+
+    def byte_masker(self) -> "ByteMask":
+        """A streaming masker over the needles as they stand now."""
+        self._prune()
+        return ByteMask([n.encode("utf-8") for n, _ in self._needles])
+
     def redact(self, text: str) -> str:
+        self._prune()
         for needle, mask in self._needles:
             if needle in text:
                 text = text.replace(needle, mask)
@@ -286,6 +338,43 @@ class SecretStore:
 
     def log_filter(self) -> logging.Filter:
         return SecretMask(self)
+
+
+class ByteMask:
+    """Masks needles in a byte stream, holding back the tail that could be the
+    start of one. Best-effort: a value the file holds in another encoding
+    (base64, split, compressed) is not seen."""
+
+    def __init__(self, needles: list[bytes]):
+        self._needles = [n for n in needles if n]
+        self._keep = max((len(n) for n in self._needles), default=1) - 1
+        self._mask = REDACTED.encode()
+        self._carry = b""
+
+    @property
+    def active(self) -> bool:
+        return bool(self._needles)
+
+    def _replace(self, data: bytes) -> bytes:
+        for needle in self._needles:
+            if needle in data:
+                data = data.replace(needle, self._mask)
+        return data
+
+    def feed(self, chunk: bytes) -> bytes:
+        data = self._replace(self._carry + chunk)
+        if self._keep and len(data) > self._keep:
+            self._carry, data = data[-self._keep:], data[:-self._keep]
+            return data
+        if self._keep:
+            self._carry, data = data, b""
+            return data
+        self._carry = b""
+        return data
+
+    def flush(self) -> bytes:
+        data, self._carry = self._replace(self._carry), b""
+        return data
 
 
 class SecretMask(logging.Filter):

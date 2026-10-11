@@ -12,6 +12,9 @@ What is enforced, and where:
 * The page script parks `create()` and reports it; this module decides. Not
   armed, another site, another origin, or a second request: the site gets a
   `NotAllowedError` and nothing is minted.
+* An approval is bound to the one parked ceremony: its tab, its rpId and the
+  user handle the page asked to register. Only a credential that matches is
+  taken; any other, even while the approval is in flight, is removed at once.
 * The page script is the first line only. A credential that appears in an
   authenticator without an approval for this very arming, or for another site,
   or after the ten minutes, is removed (on its event and on every look).
@@ -27,7 +30,7 @@ import urllib.request
 from dataclasses import dataclass, field
 from urllib.parse import urlsplit
 
-from .secrets import SecretStore, b64_std
+from .secrets import SecretStore, b64_bytes, b64_std
 
 log = logging.getLogger("loom_computer")
 
@@ -46,6 +49,11 @@ _GUARD = """(binding, nonce) => {
   const pending = new Map();
   const newId = () => Array.from(crypto.getRandomValues(new Uint8Array(16)),
                                  (b) => b.toString(16).padStart(2, '0')).join('');
+  const b64 = (v) => { try {
+    const u = v instanceof ArrayBuffer ? new Uint8Array(v)
+      : new Uint8Array(v.buffer, v.byteOffset, v.byteLength);
+    return btoa(String.fromCharCode(...u)).slice(0, 400);
+  } catch (e) { return null; } };
   const text = (v) => { try { return v == null ? null : String(v).slice(0, 200); } catch (e) { return null; } };
   const guarded = function create(options) {
     if (!options || !options.publicKey) return original.apply(this, arguments);
@@ -56,7 +64,7 @@ _GUARD = """(binding, nonce) => {
       let rp = {}, user = {};
       try { rp = pk.rp || {}; user = pk.user || {}; } catch (e) {}
       ask(JSON.stringify({id, rpId: text(rp.id), rpName: text(rp.name),
-                          userName: text(user.name),
+                          userName: text(user.name), userId: b64(user.id),
                           userDisplayName: text(user.displayName)}));
     });
   };
@@ -168,6 +176,7 @@ class _Registration:
     status: str = "armed"  # armed -> asked -> approved -> registered
     ask: dict | None = None
     parked: tuple | None = None  # (tab, execution context id, page-side id)
+    user_handle: bytes | None = None  # the user.id the parked ceremony registers
     passkey: dict | None = None
 
 
@@ -351,28 +360,41 @@ class Passkeys:
     def _protected(self) -> set[bytes]:
         reg = self._reg
         if reg and reg.status == "registered" and reg.passkey:
-            from .secrets import b64_bytes
             return {b64_bytes(reg.passkey["credentialId"])}
         return set()
+
+    def _is_ceremony(self, tab: _Tab, credential: dict) -> bool:
+        """The credential is the one the approved, parked ceremony mints."""
+        reg = self._reg
+        if (reg is None or reg.status != "approved" or not reg.parked
+                or reg.parked[0] is not tab or credential.get("rpId") != reg.rp_id
+                or not credential.get("privateKey")):
+            return False
+        if reg.user_handle is not None:
+            try:
+                handle = b64_bytes(credential.get("userHandle") or "")
+            except ValueError:
+                return False
+            return handle == reg.user_handle
+        return True
 
     async def _sync(self, tab: _Tab) -> None:
         """Make the tab's authenticator hold exactly the granted passkeys
         (plus a just-minted one until the desk has taken it)."""
-        from .secrets import b64_bytes
-
         got = await tab.conn.call("WebAuthn.getCredentials",
                                   {"authenticatorId": tab.authenticator})
         wanted = {k.key: k for k in self._store.passkeys.values()}
         keep = self._protected()
         # While an approved mint is in flight its event decides, not this look.
-        minting = self._reg is not None and self._reg.status == "approved"
+        reg = self._reg
+        minting = reg is not None and reg.status == "approved"
         present: dict[bytes, dict] = {}
         for credential in got.get("credentials", []):
             ident = b64_bytes(credential["credentialId"])
             record = wanted.get(ident)
             if ident in keep and record is None:
                 present[ident] = credential
-            elif record is None and minting:
+            elif record is None and minting and self._is_ceremony(tab, credential):
                 continue
             elif record is None or credential.get("privateKey") != record.private_key:
                 await tab.conn.call("WebAuthn.removeCredential", {
@@ -480,12 +502,16 @@ class Passkeys:
                     if _clip(raw.get(key)):
                         asked[key] = _clip(raw[key])
                 reg.status, reg.ask, reg.parked = "asked", asked, (tab, context, ident)
+                reg.user_handle = None
+                if isinstance(raw.get("userId"), str) and raw["userId"]:
+                    try:
+                        reg.user_handle = b64_bytes(raw["userId"])
+                    except ValueError:
+                        pass
         if asked is None:
             await self._release(tab, context, ident, "deny")
 
     async def _on_credential(self, tab: _Tab, credential: dict) -> None:
-        from .secrets import b64_bytes
-
         try:
             ident = b64_bytes(credential.get("credentialId", ""))
         except ValueError:
@@ -494,9 +520,7 @@ class Passkeys:
             return  # one the desk granted, loaded by us
         self._expire()
         reg = self._reg
-        if (reg is not None and reg.status == "approved" and reg.parked
-                and reg.parked[0] is tab and credential.get("rpId") == reg.rp_id
-                and credential.get("privateKey")):
+        if reg is not None and self._is_ceremony(tab, credential):
             record = {"kind": "passkey", "rpId": reg.rp_id,
                       "credentialId": b64_std(credential["credentialId"]),
                       "privateKey": b64_std(credential["privateKey"])}

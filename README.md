@@ -53,9 +53,15 @@ contract's own signal that a release predates it).
 
 Design:
 
-- **Memory only.** The set lives in `SecretStore` (`loom_computer/secrets.py`);
-  nothing touches disk and a restart clears it. Routes parse bodies by hand so
-  a framework validation error can never echo a value.
+- **API store in memory only.** The set lives in `SecretStore`
+  (`loom_computer/secrets.py`); this API never writes it to disk, and a
+  restart clears it. That is the whole guarantee: it covers the store, not
+  what happens to a value afterwards. A job holds its variables in its own
+  environment and can write them to a file; the workspace and the browser
+  profile persist (a login typed into a page may be kept by the browser, and
+  a passkey lives in the browser's authenticator while the tab does). Routes
+  parse bodies by hand so a framework validation error can never echo a
+  value.
 - **Variables** are merged into the environment of every `shell` / `files
   run` job (`Tools._job_env`) after the workspace's `.loom/env`, skipping
   names that are not valid identifiers and `LOOM_COMPUTER*`. They are never
@@ -64,10 +70,28 @@ Design:
   constants, so they never inherit the bearer.
 - **Redaction.** Every tool answer (text blocks and structured content,
   errors included) has each granted value (variables, logins' username /
-  password / totp secret, passkeys' key material) replaced by `[REDACTED]`,
-  also in its JSON-escaped form; log records are masked the same way. Limits:
-  screenshots are pixels, and a job that re-encodes a value (base64, reversal)
-  can print a form the mask does not know.
+  password / totp secret, passkeys' key material) replaced by `[REDACTED]`.
+  Structured answers are masked in their Python objects *before* JSON
+  serialization, so no escape form (`\uXXXX`, `\b`, `\f`, ...) can carry a
+  value; log records are masked the same way. Three lifetimes matter:
+  replacing the set does not unmask a value a running job still holds (it
+  stays masked until that job has finished and answered), a generated TOTP
+  code is masked from the moment it is made until its 30 s step ends plus a
+  10 s margin, and a minted passkey's key joins the masks.
+  `GET /files/download` masks the same values in the bytes it streams
+  (`X-Loom-Redacted: best-effort`, no `Content-Length`, `max_bytes` counts
+  output bytes). That is byte-level matching of the value as UTF-8 (and its
+  JSON-escaped spelling): a value a file holds re-encoded (base64, compressed,
+  split across lines, UTF-16) is not recognized.
+- **Known limits (design questions, left as they are).**
+  Variables are in the environment of *every* job, so any job can read and
+  print or transform them; redaction only catches the plain forms. The
+  browser's CDP port is reachable from inside the container, so a job can
+  drive the browser (read a filled password field, or a page's text before
+  masking) and the passkey guard is a defense against pages, not against code
+  running in the container. Screenshots (`capture image`/`png`) are pixels
+  and are not redacted. A login's `sites` entry covers its host *and every
+  subdomain of it*, so a page anywhere under that host receives the secret.
 - **Logins.** `browser fill {selector, secret, field?}`; the page origin is
   read and checked against `sites` and the typing happens in the same page
   evaluation guarded by that origin, so a navigation cannot slip between. A
@@ -95,6 +119,9 @@ Design:
   and the authenticator's `credentialAdded` event yields the record. Anything
   that appears in an authenticator without an approval for this arming (or for
   another site, or after expiry) is removed on its event and on every look.
+  The approval is bound to the parked ceremony (its tab, rpId and the
+  `user.id` the page asked to register): only that credential is taken, and
+  any other, even while the approval is in flight, is removed immediately.
   Minted key material joins the redaction masks.
 
 ## The tools (Phase 2)

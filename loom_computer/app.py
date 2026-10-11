@@ -312,23 +312,43 @@ def create_app(token: str, desktop: Desktop | None = None,
             if "outside the workspace" in text:
                 return _download_error(403, text)
             return _download_error(400, text)
+        owned = _OwnedFd(fd)
+        # Granted values are masked in the bytes as they leave (best-effort,
+        # byte-level), so the length is only known up front when none apply.
+        mask = store.byte_masker()
         length = size if limit is None else min(size, limit)
 
-        owned = _OwnedFd(fd)
-
         async def body():
-            left = length
-            while left > 0:
-                chunk = await asyncio.to_thread(owned.read, min(65536, left))
+            if not mask.active:
+                left = length
+                while left > 0:
+                    chunk = await asyncio.to_thread(owned.read, min(65536, left))
+                    if not chunk:
+                        break
+                    left -= len(chunk)
+                    yield chunk
+                return
+            left = limit  # bytes of masked output; None is no cut
+            while left is None or left > 0:
+                chunk = await asyncio.to_thread(owned.read, 65536)
+                out = mask.feed(chunk) if chunk else mask.flush()
+                if left is not None:
+                    out = out[:left]
+                    left -= len(out)
+                if out:
+                    yield out
                 if not chunk:
                     break
-                left -= len(chunk)
-                yield chunk
 
-        return _FdResponse(owned, body(), media_type="application/octet-stream", headers={
-            "Content-Length": str(length), "Cache-Control": "no-store",
-            "X-Content-Type-Options": "nosniff",
-            "X-Loom-Truncated": "true" if length < size else "false"})
+        headers = {"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"}
+        if not mask.active:
+            headers["Content-Length"] = str(length)
+            headers["X-Loom-Truncated"] = "true" if length < size else "false"
+        else:
+            headers["X-Loom-Redacted"] = "best-effort"
+            headers["X-Loom-Truncated"] = "true" if limit is not None and size > limit else "false"
+        return _FdResponse(owned, body(), media_type="application/octet-stream",
+                           headers=headers)
 
     @app.get("/", response_class=HTMLResponse)
     async def viewer():
