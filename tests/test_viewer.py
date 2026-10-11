@@ -25,9 +25,11 @@ class FakeDesktop:
             raise RuntimeError("no display")
         return 640, 480, JPEG, b"d" * 16
 
-    async def key_down(self, keysym):
-        self.calls.append(("key_down", keysym))
+    async def keycode(self, keysym):
         return keysym + 1000
+
+    async def key_down(self, keycode):
+        self.calls.append(("key_down", keycode - 1000))
 
     async def key_up(self, keycode):
         self.calls.append(("key_up", keycode))

@@ -117,24 +117,32 @@ class Desktop:
         jpeg = await self._run(_encode, width, height, bgra)
         return width, height, jpeg, digest
 
-    async def key_down(self, keysym: int) -> int | None:
-        code = await self._run(self._keycode, keysym)
-        if code:
-            self._held_keys[code] = self._held_keys.get(code, 0) + 1
-            await self._run(self._fake, "key_down", code)
-            return code
-        return None
+    async def keycode(self, keysym: int) -> int | None:
+        return await self._run(self._keycode, keysym) or None
+
+    async def key_down(self, keycode: int) -> None:
+        """Hold `keycode`. Callers record the hold first; the count is bumped
+        with no await in between and the injection is shielded, so a
+        cancellation cannot leave a count nobody will release."""
+        await self._hold(self._held_keys, keycode, "key_down")
 
     async def key_up(self, keycode: int) -> None:
         if _release(self._held_keys, keycode):
-            await self._run(self._fake, "key_up", keycode)
+            await asyncio.shield(self._run(self._fake, "key_up", keycode))
 
     async def button(self, number: int, down: bool) -> None:
         if down:
-            self._held_buttons[number] = self._held_buttons.get(number, 0) + 1
-        elif not _release(self._held_buttons, number):
-            return
-        await self._run(self._fake, "btn_down" if down else "btn_up", number)
+            await self._hold(self._held_buttons, number, "btn_down")
+        elif _release(self._held_buttons, number):
+            await asyncio.shield(self._run(self._fake, "btn_up", number))
+
+    async def _hold(self, held: dict[int, int], item: int, kind: str) -> None:
+        held[item] = held.get(item, 0) + 1
+        try:
+            await asyncio.shield(self._run(self._fake, kind, item))
+        except Exception:
+            _release(held, item)  # never pressed: don't strand the count
+            raise
 
     async def move(self, x: int, y: int) -> None:
         await self._run(self._fake, "motion", 0, x, y)
@@ -142,7 +150,9 @@ class Desktop:
 
 def _release(held: dict[int, int], item: int) -> bool:
     """Drop one hold on `item`; True when nobody holds it any more."""
-    count = held.get(item, 0) - 1
+    if item not in held:
+        return False
+    count = held[item] - 1
     if count > 0:
         held[item] = count
         return False
@@ -193,8 +203,14 @@ class InputSession:
         for bit, number in _BUTTON_BITS:
             was, now = bool(self._buttons & bit), bool(buttons & bit)
             if was != now:
-                await self.desktop.button(number, now)
-        self._buttons = buttons & 7
+                # Record first: if cancellation lands mid-injection,
+                # release_all still knows to let the button go.
+                self._buttons = (self._buttons | bit) if now else (self._buttons & ~bit)
+                try:
+                    await self.desktop.button(number, now)
+                except Exception:
+                    self._buttons = (self._buttons & ~bit) | (bit if was else 0)
+                    raise
 
     async def _key(self, key, down) -> None:
         if not isinstance(down, bool):
@@ -204,10 +220,15 @@ class InputSession:
             return
         if down:
             if key in self._keys:  # auto-repeat: release first so it re-fires
-                await self.desktop.key_up(self._keys[key])
-            code = await self.desktop.key_down(keysym)
+                await self.desktop.key_up(self._keys.pop(key))
+            code = await self.desktop.keycode(keysym)
             if code:
-                self._keys[key] = code
+                self._keys[key] = code  # recorded before the count is bumped
+                try:
+                    await self.desktop.key_down(code)
+                except Exception:
+                    self._keys.pop(key, None)
+                    raise
         elif key in self._keys:
             await self.desktop.key_up(self._keys.pop(key))
 
