@@ -1,0 +1,5 @@
+#!/bin/sh
+# Run the given command once the X display is accepting connections.
+socket="/tmp/.X11-unix/X${DISPLAY#:}"
+until [ -S "$socket" ]; do sleep 0.2; done
+exec "$@"

@@ -1,5 +1,7 @@
 """HTTP surface of the computer: /health, /mcp, /, /ws."""
 
+import asyncio
+import base64
 import copy
 import hashlib
 import hmac
@@ -11,23 +13,30 @@ import sys
 from importlib import resources
 
 from fastapi import FastAPI, Request, WebSocket
+from starlette.websockets import WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from . import VERSION
+from .desktop import Desktop, FrameHub, InputSession
 
 PORT = 8787
 SKILL_NAME = "loom-computer"
 log = logging.getLogger("loom_computer")
 
-VIEWER_HTML = """<!doctype html>
-<html lang="en">
-<head><meta charset="utf-8"><title>Loom Computer</title></head>
-<body>
-<h1>Loom Computer</h1>
-<p>The viewer lands in Phase 1.</p>
-</body>
-</html>
-"""
+
+def _viewer_page() -> tuple[str, str]:
+    """The viewer HTML and a CSP that allows exactly its inline script/style."""
+    html = resources.files(__package__).joinpath("viewer.html").read_text("utf-8")
+
+    def digest(tag: str) -> str:
+        body = re.search(rf"<{tag}>(.*?)</{tag}>", html, re.S).group(1)
+        return "'sha256-" + base64.b64encode(
+            hashlib.sha256(body.encode("utf-8")).digest()).decode() + "'"
+
+    csp = ("default-src 'none'; img-src blob: data:; connect-src 'self' ws: wss:; "
+           f"script-src {digest('script')}; style-src {digest('style')}; "
+           "base-uri 'none'; form-action 'none'")
+    return html, csp
 
 
 def _skill_document() -> str:
@@ -125,11 +134,14 @@ def _handle_rpc(message: dict) -> dict | None:
     return _not_implemented(rpc_id)
 
 
-def create_app(token: str) -> FastAPI:
+def create_app(token: str, desktop: Desktop | None = None) -> FastAPI:
     if not token:
         raise ValueError("LOOM_COMPUTER_TOKEN must be a non-empty token")
     app = FastAPI(title="Loom Computer", version=VERSION,
                   docs_url=None, redoc_url=None, openapi_url=None)
+
+    hub = FrameHub(desktop or Desktop())
+    viewer_html, viewer_csp = _viewer_page()
 
     def token_ok(candidate: str | None) -> bool:
         return candidate is not None and hmac.compare_digest(
@@ -177,7 +189,11 @@ def create_app(token: str) -> FastAPI:
 
     @app.get("/", response_class=HTMLResponse)
     async def viewer():
-        return VIEWER_HTML
+        return HTMLResponse(viewer_html, headers={
+            "Content-Security-Policy": viewer_csp,
+            "Referrer-Policy": "no-referrer",
+            "Cache-Control": "no-store",
+        })
 
     @app.websocket("/ws")
     async def ws(websocket: WebSocket):
@@ -187,11 +203,67 @@ def create_app(token: str) -> FastAPI:
         if not token_ok(websocket.query_params.get("token")):
             await websocket.close(code=1008, reason="unauthorized")
             return
-        await websocket.send_text(json.dumps(
-            {"error": "not_implemented", "message": "the viewer socket lands in Phase 1"}))
-        await websocket.close(code=1013, reason="not implemented")
+        queue = hub.subscribe()
+        session: InputSession | None = None
+        try:
+            first = await queue.get()
+            if isinstance(first, Exception):
+                raise first
+            width, height, _ = first
+            await websocket.send_text(json.dumps(
+                {"type": "hello", "width": width, "height": height}))
+            session = InputSession(hub.desktop, width, height)
+            sender = asyncio.create_task(_send_frames(websocket, queue, first))
+            receiver = asyncio.create_task(_receive_input(websocket, session))
+            done, pending = await asyncio.wait(
+                {sender, receiver}, return_when=asyncio.FIRST_COMPLETED)
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+            for outcome in await asyncio.gather(*done, return_exceptions=True):
+                if isinstance(outcome, Exception) and not isinstance(
+                        outcome, WebSocketDisconnect):
+                    raise outcome
+        except WebSocketDisconnect:
+            pass
+        except Exception:  # noqa: BLE001
+            log.exception("viewer socket failed")
+            try:
+                await websocket.close(code=1011, reason="desktop unavailable")
+            except RuntimeError:
+                pass
+        finally:
+            hub.unsubscribe(queue)
+            if session is not None:
+                await session.release_all()
 
     return app
+
+
+async def _send_frames(websocket: WebSocket, queue: asyncio.Queue, first) -> None:
+    """Frames go out as binary JPEG messages, newest only."""
+    item = first
+    while True:
+        if isinstance(item, Exception):
+            raise item
+        await websocket.send_bytes(item[2])
+        item = await queue.get()
+
+
+async def _receive_input(websocket: WebSocket, session: InputSession) -> None:
+    """Text messages in are JSON input events; binary ones are refused."""
+    while True:
+        message = await websocket.receive()
+        if message["type"] == "websocket.disconnect":
+            raise WebSocketDisconnect(message.get("code", 1000))
+        if message.get("bytes") is not None:
+            await websocket.close(code=1003, reason="text only")
+            return
+        try:
+            event = json.loads(message.get("text") or "")
+        except ValueError:
+            continue
+        await session.handle(event)
 
 
 _TOKEN_QUERY = re.compile(r"([?&]token=)[^&\s\"']*")

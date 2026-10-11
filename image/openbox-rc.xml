@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Minimal Openbox: no desktop menu, no panel, windows open maximized. -->
+<openbox_config xmlns="http://openbox.org/3.4/rc">
+  <focus><focusNew>yes</focusNew><followMouse>no</followMouse></focus>
+  <placement><policy>Smart</policy></placement>
+  <theme><name>Clearlooks</name><titleLayout>NLIMC</titleLayout></theme>
+  <desktops><number>1</number></desktops>
+  <applications>
+    <application class="*"><maximized>yes</maximized></application>
+  </applications>
+  <mouse><context name="Root"/></mouse>
+  <keyboard/>
+</openbox_config>

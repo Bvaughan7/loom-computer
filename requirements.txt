@@ -1,3 +1,8 @@
 fastapi==0.115.6
 uvicorn==0.34.0
 websockets==14.1
+mss==10.2.0
+pillow==12.3.0
+python-xlib==0.33
+six==1.17.0
+supervisor==4.3.0

@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>Loom Computer</title>
+<style>
+html, body { margin: 0; height: 100%; background: #111; overflow: hidden; }
+#screen { display: block; margin: auto; max-width: 100vw; max-height: 100vh;
+  outline: none; touch-action: none; cursor: default; }
+#status { position: fixed; top: 8px; left: 8px; padding: 4px 10px; border-radius: 4px;
+  font: 13px system-ui, sans-serif; color: #eee; background: rgba(0, 0, 0, .7); }
+#status:empty { display: none; }
+</style>
+</head>
+<body>
+<canvas id="screen" tabindex="0" width="1280" height="800"></canvas>
+<div id="status">Connecting…</div>
+<script>
+(function () {
+  "use strict";
+  var canvas = document.getElementById("screen");
+  var ctx = canvas.getContext("2d");
+  var statusEl = document.getElementById("status");
+  // The token rides in the URL fragment, so it is never part of a request line.
+  var token = decodeURIComponent(location.hash.replace(/^#/, ""));
+  var socket = null, retry = 500, buttons = 0, lastX = 0, lastY = 0, drawing = false, pending = null;
+
+  function say(text) { statusEl.textContent = text; }
+
+  function connect() {
+    if (!token) { say("No token in the URL fragment."); return; }
+    var scheme = location.protocol === "https:" ? "wss:" : "ws:";
+    socket = new WebSocket(scheme + "//" + location.host + "/ws?token=" + encodeURIComponent(token));
+    socket.binaryType = "blob";
+    socket.onmessage = function (event) {
+      if (typeof event.data === "string") {
+        var hello = JSON.parse(event.data);
+        if (hello.type === "hello") {
+          canvas.width = hello.width; canvas.height = hello.height;
+          retry = 500; say(""); canvas.focus();
+        }
+        return;
+      }
+      pending = event.data; draw();
+    };
+    socket.onclose = function (event) {
+      socket = null;
+      if (event.code === 1008) { say("Unauthorized: the token is wrong."); return; }
+      say("Disconnected; reconnecting…");
+      setTimeout(connect, retry); retry = Math.min(retry * 2, 8000);
+    };
+  }
+
+  // Decode one frame at a time; a newer frame replaces one still waiting.
+  function draw() {
+    if (drawing || !pending) return;
+    var blob = pending; pending = null; drawing = true;
+    createImageBitmap(blob).then(function (bitmap) {
+      ctx.drawImage(bitmap, 0, 0); bitmap.close();
+    }).catch(function () {}).then(function () { drawing = false; draw(); });
+  }
+
+  function send(message) {
+    if (socket && socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify(message));
+  }
+
+  function point(event) {
+    var box = canvas.getBoundingClientRect();
+    return {
+      x: Math.round((event.clientX - box.left) * canvas.width / box.width),
+      y: Math.round((event.clientY - box.top) * canvas.height / box.height)
+    };
+  }
+
+  function pointer(event) {
+    var p = point(event);
+    buttons = event.buttons; lastX = p.x; lastY = p.y;
+    send({ t: "pointer", x: p.x, y: p.y, buttons: buttons });
+  }
+
+  canvas.addEventListener("pointermove", pointer);
+  canvas.addEventListener("pointerdown", function (event) {
+    canvas.setPointerCapture(event.pointerId); canvas.focus(); pointer(event);
+  });
+  canvas.addEventListener("pointerup", pointer);
+  canvas.addEventListener("contextmenu", function (event) { event.preventDefault(); });
+  canvas.addEventListener("wheel", function (event) {
+    event.preventDefault();
+    send({ t: "wheel", dy: Math.sign(event.deltaY) });
+  }, { passive: false });
+
+  // Keys the host currently believes are down, so every one gets a release
+  // even when focus or a Meta shortcut swallows the matching keyup.
+  var held = {};
+
+  function releaseKey(name) {
+    if (!held[name]) return;
+    delete held[name];
+    send({ t: "key", key: name, down: false });
+  }
+
+  function releaseButtons() {
+    if (buttons) {
+      buttons = 0;
+      send({ t: "pointer", x: lastX, y: lastY, buttons: 0 });
+    }
+  }
+
+  function releaseAll() {
+    Object.keys(held).forEach(releaseKey);
+    releaseButtons();
+  }
+
+  canvas.addEventListener("keydown", function (event) {
+    if (event.metaKey && event.key !== "Meta") return; // leave browser shortcuts alone
+    event.preventDefault();
+    held[event.key] = true;
+    send({ t: "key", key: event.key, down: true });
+  });
+  canvas.addEventListener("keyup", function (event) {
+    // Never suppressed: a release must get through even mid-shortcut.
+    if (held[event.key] || !event.metaKey) event.preventDefault();
+    releaseKey(event.key);
+    // Browsers drop the keyups of keys pressed under Meta, so letting go of
+    // Meta lets go of everything.
+    if (event.key === "Meta") Object.keys(held).forEach(releaseKey);
+  });
+  canvas.addEventListener("blur", releaseAll);
+  window.addEventListener("blur", releaseAll);
+  document.addEventListener("visibilitychange", function () {
+    if (document.hidden) releaseAll();
+  });
+  // event.buttons can't be trusted once capture ends with a button still
+  // down (no pointerup may follow), so let go of everything held.
+  canvas.addEventListener("pointercancel", releaseButtons);
+  canvas.addEventListener("lostpointercapture", releaseButtons);
+
+  connect();
+})();
+</script>
+</body>
+</html>
