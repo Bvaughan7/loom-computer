@@ -23,6 +23,7 @@ from . import VERSION
 from .browser import Browser
 from .desktop import Desktop, FrameHub, InputSession
 from .errors import ToolError
+from .secrets import SecretMask, SecretStore, SecretsError
 from .tools import DEFINITIONS, Tools
 
 PORT = 8787
@@ -63,6 +64,11 @@ class _OwnedFd:
     def read(self, n: int) -> bytes:
         with self._lock:
             return os.read(self._fd, n) if self._fd is not None else b""
+
+    def pread(self, n: int, offset: int) -> bytes:
+        """Bytes at `offset`, leaving the read position where it was."""
+        with self._lock:
+            return os.pread(self._fd, n, offset) if self._fd is not None else b""
 
     def close(self) -> None:
         with self._lock:
@@ -172,8 +178,14 @@ def create_app(token: str, desktop: Desktop | None = None,
     if not token:
         raise ValueError("LOOM_COMPUTER_TOKEN must be a non-empty token")
     desktop = desktop or Desktop()
+    browser = browser or Browser()
+    store = SecretStore()
+    package_log = logging.getLogger("loom_computer")
+    for old in [f for f in package_log.filters if isinstance(f, SecretMask)]:
+        package_log.removeFilter(old)  # one app, one set (tests make many)
+    package_log.addFilter(store.log_filter())
     tools = Tools(guide, desktop,
-                  workspace or os.environ.get("LOOM_WORKSPACE", WORKSPACE), browser)
+                  workspace or os.environ.get("LOOM_WORKSPACE", WORKSPACE), browser, store)
 
     @contextlib.asynccontextmanager
     async def lifespan(_app):
@@ -183,6 +195,7 @@ def create_app(token: str, desktop: Desktop | None = None,
     app = FastAPI(title="Loom Computer", version=VERSION, lifespan=lifespan,
                   docs_url=None, redoc_url=None, openapi_url=None)
 
+    app.state.secrets = store
     hub = FrameHub(desktop)
     viewer_html, viewer_csp = _viewer_page()
 
@@ -230,6 +243,28 @@ def create_app(token: str, desktop: Desktop | None = None,
         invalid = response.get("error", {}).get("code") == INVALID_REQUEST
         return JSONResponse(response, status_code=400 if invalid else 200)
 
+    async def _json_body(request: Request):
+        # Parsed by hand: a framework validation error would echo the input.
+        try:
+            return json.loads(await request.body())
+        except ValueError:
+            return None
+
+    def _bad(message: str, status: int = 400) -> JSONResponse:
+        return JSONResponse({"error": message}, status_code=status)
+
+    @app.put("/secrets")
+    async def put_secrets(request: Request):
+        """The whole granted set, replacing the last. Held in memory only; no
+        route answers a value back."""
+        try:
+            counts = store.replace(await _json_body(request))
+        except SecretsError as exc:
+            return _bad(str(exc))
+        log.info("secrets replaced: %d variables, %d logins",
+                 counts["variables"], counts["logins"])
+        return {"ok": True, **counts}
+
     @app.get("/files/download")
     async def download(path: str = "", max_bytes: str | None = None):
         """Raw bytes of one workspace file, for the desk. Same confinement
@@ -248,23 +283,40 @@ def create_app(token: str, desktop: Desktop | None = None,
             if "outside the workspace" in text:
                 return _download_error(403, text)
             return _download_error(400, text)
-        length = size if limit is None else min(size, limit)
-
         owned = _OwnedFd(fd)
-
-        async def body():
-            left = length
-            while left > 0:
-                chunk = await asyncio.to_thread(owned.read, min(65536, left))
+        # Granted values are masked in the bytes as they leave (best-effort,
+        # byte-level), asking the live set at every chunk. The cut counts
+        # masked bytes, so whether it applies is found by a pass over the
+        # file first; the length is never known up front.
+        mask = store.byte_masker()
+        truncated = False
+        if limit is not None:
+            probe, seen, offset = store.byte_masker(), 0, 0
+            while seen <= limit:
+                chunk = await asyncio.to_thread(owned.pread, 65536, offset)
+                offset += len(chunk)
+                seen += len(probe.feed(chunk) if chunk else probe.flush())
                 if not chunk:
                     break
-                left -= len(chunk)
-                yield chunk
+            truncated = seen > limit
 
-        return _FdResponse(owned, body(), media_type="application/octet-stream", headers={
-            "Content-Length": str(length), "Cache-Control": "no-store",
-            "X-Content-Type-Options": "nosniff",
-            "X-Loom-Truncated": "true" if length < size else "false"})
+        async def body():
+            left = limit  # bytes of masked output; None is no cut
+            while left is None or left > 0:
+                chunk = await asyncio.to_thread(owned.read, 65536)
+                out = mask.feed(chunk) if chunk else mask.flush()
+                if left is not None:
+                    out = out[:left]
+                    left -= len(out)
+                if out:
+                    yield out
+                if not chunk:
+                    break
+
+        headers = {"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff",
+                   "X-Loom-Truncated": "true" if truncated else "false"}
+        return _FdResponse(owned, body(), media_type="application/octet-stream",
+                           headers=headers)
 
     @app.get("/", response_class=HTMLResponse)
     async def viewer():
@@ -361,14 +413,16 @@ class _RedactToken(logging.Filter):
         return True
 
 
-def log_config() -> dict:
+def log_config(store: SecretStore | None = None) -> dict:
     """Uvicorn's logging config with token redaction on every handler."""
     from uvicorn.config import LOGGING_CONFIG
 
     config = copy.deepcopy(LOGGING_CONFIG)
     config["filters"] = {"redact_token": {"()": _RedactToken}}
+    if store is not None:
+        config["filters"]["redact_secrets"] = {"()": store.log_filter}
     for handler in config["handlers"].values():
-        handler["filters"] = ["redact_token"]
+        handler["filters"] = list(config["filters"])
     return config
 
 
@@ -380,5 +434,8 @@ def main() -> None:
     if not token:
         sys.exit("loom-computer: LOOM_COMPUTER_TOKEN is not set; refusing to start "
                  "(every /mcp call needs a bearer token)")
-    uvicorn.run(create_app(token), host="0.0.0.0", port=PORT, log_level="info",
-                access_log=False, log_config=log_config())
+    app = create_app(token)
+    for handler in logging.getLogger().handlers:
+        handler.addFilter(app.state.secrets.log_filter())
+    uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="info",
+                access_log=False, log_config=log_config(app.state.secrets))

@@ -27,8 +27,140 @@ loopback). The server refuses to start if `LOOM_COMPUTER_TOKEN` is unset.
 Nothing runs as root: the image uses the `agent` user (UID 1000) with
 `/home/agent/workspace` as its working directory.
 
-Not yet implemented: `PUT /secrets`, `/passkeys/registration`,
-`DELETE /logins/{name}`, `state login_load`.
+Phase 3 adds the secrets route below. Not implemented (not in Phase 3's
+scope): `DELETE /logins/{name}` and `state login_load`. Passkeys (the
+registration ceremony and the loading/guard machinery) are held for redesign
+(see *Held for redesign*).
+
+### `state login_load` (left unimplemented, deliberately)
+
+The contract names it once, as how the desk's cookie import
+(`import-<browser>-<profile>`) is "loaded", and defines nothing else: not its
+arguments, not where a saved login's cookies are kept, not what it answers.
+Inventing a store and a format here would be guessing at an interface the
+desk has to match byte for byte, so `state` still answers
+`state: unknown action login_load`. `DELETE /logins/{name}` is its
+counterpart and is left for the same reason (and the 404 it answers is the
+contract's own signal that a release predates it).
+
+## Secrets (Phase 3)
+
+| Route | Behavior |
+| --- | --- |
+| `PUT /secrets` | Bearer. The whole granted set, a JSON object of name to secret, replacing the last. A string is a variable; `{"kind":"login","sites":[...],"username","password","totp"?}` (`totp` base32 or an `otpauth://` URI). A `{"kind":"passkey",...}` record is refused: the **whole set** is `400`, naming the secret (never a value), because passkeys are held for redesign. Answers `200 {"ok":true,"variables":n,"logins":n}`; a malformed set is `400 {"error"}` (naming the secret and the field, never a value) and leaves the previous set. There is **no GET**. |
+
+Design:
+
+- **API store in memory only.** The set lives in `SecretStore`
+  (`loom_computer/secrets.py`); this API never writes it to disk, and a
+  restart clears it. That is the whole guarantee: it covers the store, not
+  what happens to a value afterwards. A job holds its variables in its own
+  environment and can write them to a file; the workspace and the browser
+  profile persist (a login typed into a page may be kept by the browser, and
+  and so on). Routes
+  parse bodies by hand so a framework validation error can never echo a
+  value.
+- **Variables** are merged into the environment of every `shell` / `files
+  run` job (`Tools._job_env`) after the workspace's `.loom/env`, skipping
+  names that are not valid identifiers and `LOOM_COMPUTER*`. They are never
+  written to the workspace, so the desk's preparation-job environment
+  (`.loom/env`) cannot contain them. Jobs still get an environment built from
+  constants, so they never inherit the bearer.
+- **Redaction.** Every tool answer (text blocks and structured content,
+  errors included) has each granted value (variables, logins' username /
+  password / totp secret) replaced by `[REDACTED]`.
+  Structured answers are masked in their Python objects *before* JSON
+  serialization, so no escape form (`\uXXXX`, `\b`, `\f`, ...) can carry a
+  value; log records are masked the same way. Two lifetimes matter:
+  replacing the set does not unmask a value a running job still holds (it
+  stays masked until that job has finished and answered), a generated TOTP
+  code is masked from the moment it is made until its 30 s step ends plus a
+  10 s margin.
+  `GET /files/download` masks the same values in the bytes it streams
+  (`X-Loom-Redacted: best-effort`, no `Content-Length`, `max_bytes` counts
+  output bytes). That is byte-level matching of the value as UTF-8 (and its
+  JSON-escaped spelling): a value a file holds re-encoded (base64, compressed,
+  split across lines, UTF-16) is not recognized. (`files read` with `encoding: base64` masks the raw
+  bytes before encoding, so that path is covered.)
+  *Accepted limit:* the `X-Loom-Truncated` header comes from a probe made
+  before streaming starts, so it reflects the mask set at probe time and can
+  be stale if grants change mid-download. The body is always masked with the
+  live set and always capped at `max_bytes`; only that header can be stale.
+- **Known limits (design questions, left as they are).**
+  Variables are in the environment of *every* job, so any job can read and
+  print or transform them; redaction only catches the plain forms. The
+  browser's CDP port is reachable from inside the container, so a job can
+  drive the browser (read a filled password field, or a page's text before
+  masking). Screenshots (`capture image`/`png` answers)
+  are pixels and are not redacted: the agent must see the screen to work, and
+  the person sees the same screen in the viewer. A login's `sites` entry covers its host *and every
+  subdomain of it*, so a page anywhere under that host receives the secret.
+  Scope logins to real hosts: a bare public suffix (`com`, `co.uk`, ...)
+  covers every host beneath it, `attacker.com` included. No public-suffix
+  list is built in; a hand-rolled one would be incomplete and misleading.
+  `files read` with `encoding: base64` masks values at the byte level before
+  encoding. The text redactor is skipped for the encoded content only, to
+  keep the base64 valid; the `path` is masked as usual. The `[REDACTED]`
+  token is atomic and public: masked output never contains a granted value
+  in recoverable form — a value's characters may coincide with the token's
+  own text or with a substring of the base64 text, but neither coincidence
+  reveals the value. Deliberate probing is a separate matter: an agent that
+  writes a guessed value and reads it back can tell whether the guess
+  matched a granted value (it comes back masked). That confirmation oracle
+  is inherent to any output masking; this design's boundary is accidental
+  exposure, not a malicious agent. A granted value must not contain the
+  literal `[REDACTED]`; such a set is rejected at PUT.
+- **Logins.** `browser fill {selector, secret, field?}`; the page origin is
+  read and checked against `sites` and the typing happens in the same page
+  evaluation guarded by that origin, so a navigation cannot slip between. A
+  site entry covers its host and hosts within it; a bare host means https
+  (plain http only for `localhost`/`127.0.0.1`); an entry with a scheme or
+  port must match those too.
+## Held for redesign
+
+All passkey code is held, and none ships in this release: no registration
+ceremony, no virtual-authenticator loading, no guard. `PUT /secrets` refuses a
+`kind: "passkey"` record (whole set `400`, naming the secret), the
+`/passkeys/registration*` routes answer `404`, and the served guide says
+passkeys are not supported. Two designs are held, each with known issues a
+redesign must start from.
+
+### (a) Passkey registration ceremony
+
+Was `PUT` / `GET` / `DELETE /passkeys/registration`, `POST
+/passkeys/registration/answer`, and a page-side guard parking
+`navigator.credentials.create()`.
+
+1. **Tab-secret harvesting.** The guard released parked requests through
+   `window.__loomRelease`, authenticated by a per-tab secret shared with the
+   page script. A page that harvests the secret can forge guard reports.
+2. **Clean-slate race.** The authenticator was snapshotted and emptied at
+   approval and the first credential added afterwards was taken as the mint;
+   a credential added between snapshot and release races with it.
+3. **Nonce eviction at 4097.** Single-use ask nonces lived in a set bounded
+   at 4096; the 4097th evicts the oldest, which can then be replayed.
+
+### (b) Passkey loading and guard
+
+Was a CDP watcher loading granted passkeys into a virtual
+authenticator per tab, plus a guard: `Permissions-Policy:
+publickey-credentials-create=()` injected on document responses via the Fetch
+domain, a Fetch-pause readiness hold, and removal of ungranted credentials.
+All of it was passkey-specific, so nothing generic of it remains.
+
+1. **Popup interception timing.** A popup can load before the polling-based
+   interception is enabled for it, so its first document is unguarded.
+2. **Cross-process subframes.** Out-of-process subframes sit outside the
+   interception scope and get neither the policy header nor the hold.
+3. **Fail-open readiness hold.** After its retries the hold releases the
+   document without a ready authenticator, so a `get()` at load can miss.
+4. **`about:blank` cleanup race.** Cleanup of ungranted credentials on a tab
+   at `about:blank` races with the document that replaces it.
+
+### `state login_load`
+
+Still unimplemented: the contract names it with no defined arguments, store
+or answer, and this release does not invent one (see above).
 
 ## The tools (Phase 2)
 
@@ -40,7 +172,7 @@ serves; that file is the reference. Summary:
 | `state` | `action: "guide"` | `name`, `version`, `sha256`, `skill`. Any other action: `state: unknown action <action>`. |
 | `shell` | exactly one of `command` (run by `bash -c`) or `argv` (list, no shell); `cwd`, `timeout` (default 120 s, max 3600) | JSON text: `exit_code`, `stdout`, `stderr`, `timed_out`, `truncated`, `duration_s`. |
 | `files` | `action` read / write / list / run; `path`; `content`, `encoding` (utf-8/base64), `append`; run: `args`, `cwd`, `timeout` | read/write/list JSON; run answers like `shell`. Confined to `/home/agent/workspace` (symlinks resolved first). |
-| `browser` | `action` navigate / title / text / fill / click; `url`, `selector`, `value` | JSON text. Drives the Phase 1 Chromium over CDP. |
+| `browser` | `action` navigate / title / text / fill / click; `url`, `selector`, `value`; fill also `secret` (a granted login's name) with `field` username / password / totp | JSON text. Drives the Phase 1 Chromium over CDP. |
 | `capture` | `mode` image (<= 1568 px longer edge) / png / tree; `window`, `region` `[x,y,w,h]` | `image`/`png`: an MCP image block plus a text note of the scale. `tree`: accessibility tree as text. |
 
 Design choices:
@@ -138,7 +270,7 @@ python -m pytest
 0. **Skeleton**: health, MCP stub, guide, viewer and socket stubs, image. (this)
 1. **Desktop + viewer streaming**: a real X desktop, the viewer page and `/ws`. (this)
 2. **MCP tools**: `state`, `shell`, `files`, `browser`, and friends over `/mcp`.
-3. **Secrets**: `PUT /secrets`, logins, passkeys, redaction.
+3. **Secrets**: `PUT /secrets`, variables, logins, redaction. (this; passkeys held)
 4. **Release pipeline**: tagged releases published to GHCR.
 5. **Three-agent integration test**: three teammates sharing one computer
    with leases and queued runs.

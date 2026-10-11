@@ -69,6 +69,10 @@ sees in the viewer. `action` is one of:
   matching the CSS selector (up to 100,000 characters).
 - `fill` `{selector, value}`: enters `value` into an input, textarea, select
   or contenteditable element, firing `input` and `change` as typing would.
+  `fill` `{selector, secret, field?}` types a granted login instead: `secret`
+  is the login's name and `field` is `username`, `password` (default) or
+  `totp` (the current code). It is refused unless the page is one of the
+  login's own sites; you never see the value.
 - `click` `{selector}`: scrolls the element into view and clicks its centre
   with a real mouse event.
 
@@ -91,6 +95,18 @@ answer lists the windows. `region` is `[x, y, width, height]` in pixels,
 relative to the window if one is given, else to the screen; it is clipped to
 the screen. It captures what is on screen, so a window covered by another
 shows the cover.
+
+## secrets
+
+The person may grant you secrets. You never see their values: every tool
+answer has them replaced by `[REDACTED]`.
+
+- A *variable* is an environment variable of every `shell` and `files run`
+  job, under its name (`$NAME`).
+- A *login* is typed with `browser fill` and `secret`, only on its own sites.
+  Navigate there first; on any other page the fill is refused.
+- Passkeys are not supported: none is loaded, answered or created, so use a
+  site's other sign-in method.
 
 ## state
 

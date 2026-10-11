@@ -17,12 +17,14 @@ from .browser import Browser
 from .desktop import Desktop
 from .errors import ToolError
 from .jobs import Jobs, base_env, clamp_timeout, workspace_env
+from .secrets import SecretStore
 from .workspace import Workspace
 
 log = logging.getLogger("loom_computer")
 
 MAX_IMAGE_EDGE = 1568
 CAPTURE_MODES = ("image", "png", "tree")
+_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 INTERPRETERS = {".py": "python3", ".sh": "bash"}
 
 
@@ -72,13 +74,19 @@ DEFINITIONS = [
     {"name": "browser",
      "description": "Drive the desktop's Chromium (the active tab). Actions: "
                     "navigate (url), title, text (optional selector), fill "
-                    "(selector, value), click (selector).",
+                    "(selector, value; or selector and secret, the name of a saved "
+                    "login, with field username|password|totp), click (selector).",
      "inputSchema": _schema({
          "action": {"type": "string",
                     "enum": ["navigate", "title", "text", "fill", "click"]},
          "url": {"type": "string"},
          "selector": {"type": "string", "description": "CSS selector."},
-         "value": {"type": "string", "description": "fill: the text to enter."}},
+         "value": {"type": "string", "description": "fill: the text to enter."},
+         "secret": {"type": "string", "description":
+                    "fill: name of a granted login to type instead of `value`; "
+                    "only works on a page of that login's own sites."},
+         "field": {"type": "string", "enum": ["username", "password", "totp"],
+                   "description": "fill with `secret`: which part (default password)."}},
          ("action",))},
     {"name": "capture",
      "description": "Look at the computer. mode `image`: screenshot scaled to "
@@ -119,8 +127,9 @@ def _pick(args: dict, allowed: tuple) -> None:
 
 class Tools:
     def __init__(self, guide, desktop: Desktop, workspace: str,
-                 browser: Browser | None = None):
+                 browser: Browser | None = None, secrets: SecretStore | None = None):
         self._guide = guide
+        self.secrets = secrets or SecretStore()
         self._desktop = desktop
         self.workspace = Workspace(workspace)
         self.browser = browser or Browser()
@@ -135,19 +144,28 @@ class Tools:
     async def call(self, name: str, args: dict) -> dict:
         handler = getattr(self, f"_{name}")
         try:
-            return await handler(args)
+            result = await handler(args)
         except ToolError as exc:
-            return _error(f"{name}: {exc}")
+            result = _error(f"{name}: {exc}")
         except Exception as exc:  # noqa: BLE001 - a tool bug is an answer, not a 500
             log.exception("tool %s failed", name)
-            return _error(f"{name}: unexpected {type(exc).__name__}; the call was not completed")
+            result = _error(f"{name}: unexpected {type(exc).__name__}; the call was not completed")
+        # Every answer passes here: no granted value leaves in a tool result.
+        return self.secrets.redact_result(result)
+
+    def _text(self, body) -> dict:
+        """A text answer with every granted value masked in the raw objects,
+        before JSON serialization, so no escape form can carry one."""
+        if isinstance(body, str):
+            return text_result(self.secrets.redact(body))
+        return text_result(self.secrets.redact_json(body))
 
     # -- state ----------------------------------------------------------------
 
     async def _state(self, args: dict) -> dict:
         action = args.get("action")
         if action == "guide":
-            return text_result(self._guide())
+            return self._text(self._guide())
         shown = _printable(action) if isinstance(action, str) else ""
         return _error(f"state: unknown action {shown}")
 
@@ -156,6 +174,12 @@ class Tools:
     def _job_env(self) -> dict[str, str]:
         env = base_env(self._desktop.display)
         env.update(workspace_env(self.workspace.root))
+        # Granted variables: of every job, never of the workspace's env file
+        # (which a preparation job's environment is written to) and never
+        # the computer's own variables.
+        env.update({k: v for k, v in self.secrets.variables.items()
+                    if _NAME.match(k) and not k.startswith("LOOM_COMPUTER")
+                    and "\0" not in v})  # an environment cannot hold a NUL
         return env
 
     def _cwd(self, value) -> str:
@@ -171,9 +195,15 @@ class Tools:
     async def _run_job(self, argv: list[str], args: dict,
                        pass_fds: tuple[int, ...] = ()) -> dict:
         timeout = clamp_timeout(args.get("timeout"))
-        result = await self.jobs.run(argv, self._cwd(args.get("cwd")),
-                                     self._job_env(), timeout, pass_fds)
-        return text_result(result.as_dict())
+        cwd, env = self._cwd(args.get("cwd")), self._job_env()
+        # The job's environment keeps these values after the set is replaced;
+        # its output stays masked for them until it is over and answered.
+        lease = self.secrets.hold(self.secrets.variables.values())
+        try:
+            result = await self.jobs.run(argv, cwd, env, timeout, pass_fds)
+            return self._text(result.as_dict())
+        finally:
+            self.secrets.release(lease)
 
     async def _shell(self, args: dict) -> dict:
         _pick(args, ("command", "argv", "cwd", "timeout"))
@@ -199,15 +229,28 @@ class Tools:
         if encoding not in ("utf-8", "base64"):
             raise ToolError('encoding must be "utf-8" or "base64"')
         if action == "read":
-            return text_result(await _blocking(self.workspace.read, path, encoding))
+            got = await _blocking(self.workspace.read, path, encoding)
+            if encoding == "base64":
+                # mask the raw bytes: base64 of a value is not a spelling the
+                # text redactor knows
+                data = self.secrets.redact_bytes(base64.b64decode(got["content"]))
+                got = {**got, "bytes": len(data),
+                       "path": self.secrets.redact(got["path"]),
+                       "content": base64.b64encode(data).decode("ascii")}
+                # byte-level masking is complete for this content; the text
+                # redactor is skipped so the base64 stays valid
+                res = text_result(got)
+                res["_loom_bytes_masked"] = True
+                return res
+            return self._text(got)
         if action == "write":
             append = args.get("append", False)
             if not isinstance(append, bool):
                 raise ToolError("append must be a boolean")
-            return text_result(await _blocking(
+            return self._text(await _blocking(
                 self.workspace.write, path, args.get("content"), encoding, append))
         if action == "list":
-            return text_result(await _blocking(self.workspace.list, path or "."))
+            return self._text(await _blocking(self.workspace.list, path or "."))
         if action == "run":
             return await self._files_run(path, args)
         shown = _printable(action) if isinstance(action, str) else ""
@@ -237,21 +280,36 @@ class Tools:
     # -- browser --------------------------------------------------------------
 
     async def _browser(self, args: dict) -> dict:
-        _pick(args, ("action", "url", "selector", "value"))
+        _pick(args, ("action", "url", "selector", "value", "secret", "field"))
         action, b = args.get("action"), self.browser
         if action == "navigate":
-            return text_result(await b.navigate(args.get("url")))
+            return self._text(await b.navigate(args.get("url")))
         if action == "title":
-            return text_result(await b.title())
+            return self._text(await b.title())
         if action == "text":
-            return text_result(await b.text(args.get("selector")))
+            return self._text(await b.text(args.get("selector")))
         if action == "fill":
-            return text_result(await b.fill(args.get("selector"), args.get("value")))
+            return self._text(await self._fill(args))
         if action == "click":
-            return text_result(await b.click(args.get("selector")))
+            return self._text(await b.click(args.get("selector")))
         shown = _printable(action) if isinstance(action, str) else ""
         raise ToolError(f"unknown action {shown} "
                         "(one of: navigate, title, text, fill, click)")
+
+    async def _fill(self, args: dict) -> dict:
+        secret, value, field = args.get("secret"), args.get("value"), args.get("field")
+        if secret is None:
+            if field is not None:
+                raise ToolError("field applies to fill with `secret`")
+            return await self.browser.fill(args.get("selector"), value)
+        if value is not None:
+            raise ToolError("give `value` or `secret`, not both")
+        login = self.secrets.logins.get(secret) if isinstance(secret, str) else None
+        if login is None:
+            raise ToolError("no granted login by that name")
+        return await self.browser.fill_secret(
+            args.get("selector"), login, "password" if field is None else field,
+            self.secrets.remember_for)
 
     # -- capture --------------------------------------------------------------
 
@@ -272,7 +330,7 @@ class Tools:
         if mode == "tree":
             if window is not None or region is not None:
                 raise ToolError("window and region apply to image and png only")
-            return text_result(await self.browser.tree())
+            return self._text(await self.browser.tree())
         try:
             png, source, out = await self._desktop.capture(
                 window, region, MAX_IMAGE_EDGE if mode == "image" else None)

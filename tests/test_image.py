@@ -239,3 +239,104 @@ def test_a_timed_out_job_is_killed_in_the_image(container):
     result = tool(port, "shell", {"command": "sleep 300", "timeout": 1})
     assert result["timed_out"] is True
     assert docker("exec", name, "pgrep", "-x", "sleep", check=False).returncode != 0
+
+
+# -- Phase 3: secrets against the real container and Chromium -------------------
+
+P3_VALUE = "smoke-VARIABLE-7f3a9c"
+P3_PASSWORD = "smoke-PASSWORD-1b2d4e"
+P3_KEY = ("MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgRqWJh2dhYVVfPNQKF3jnILydYJT4"
+          "fTQhJFl8xUdt4OihRANCAAQ0s8ww5WFY0AgGCAdAkSDRbOrTchhs35kPKnw4Yu9pEkWgx1NxdJvhF6qP"
+          "oxMik67ig/aiCAiCSrQhog4v9wH0")
+P3_CRED = "Y3JlZGVudGlhbC1pZC0wMTIzNDU2Nzg5"
+# a passkey is refused (never loaded): only used to check the refusal
+P3_PASSKEY = {"kind": "passkey", "rpId": "localhost", "credentialId": P3_CRED,
+              "privateKey": P3_KEY, "userHandle": "AQID"}
+
+P3_LOGIN_PAGE = """<!doctype html><title>login</title>
+<input id="pw" type="password">
+<p id="out">empty</p>
+<script>document.getElementById('pw').addEventListener('input', e =>
+  document.getElementById('out').textContent = 'len=' + e.target.value.length +
+  ' value=' + e.target.value)</script>"""
+
+def http_json(port, method, path, body=None):
+    import json
+
+    data = None if body is None else json.dumps(body).encode()
+    request = urllib.request.Request(
+        f"http://127.0.0.1:{port}{path}", data=data, method=method,
+        headers={"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            return response.status, json.loads(response.read() or b"null")
+    except urllib.error.HTTPError as exc:
+        return exc.code, json.loads(exc.read() or b"null")
+
+
+def page_text(port, selector="#out", until=lambda t: True, seconds=30):
+    deadline = time.time() + seconds
+    while True:
+        text = tool(port, "browser", {"action": "text", "selector": selector})["text"]
+        if until(text) or time.time() > deadline:
+            return text
+        time.sleep(0.3)
+
+
+def test_phase3_secrets_in_the_real_container(container):
+    import json
+
+    name, port = container
+    status, body = http_json(port, "PUT", "/secrets", {
+        "SMOKE_VAR": P3_VALUE,
+        "site": {"kind": "login", "sites": ["localhost"], "username": "alice",
+                 "password": P3_PASSWORD}})
+    assert status == 200 and body["variables"] == 1 and body["logins"] == 1
+    assert http_json(port, "GET", "/secrets")[0] in (404, 405)
+
+    # variable: present in the job, redacted from what comes back
+    result = mcp(port, "shell", {"command": 'test "$SMOKE_VAR" = ' + P3_VALUE +
+                                 ' && echo present; env | grep SMOKE_VAR'})
+    text = json.dumps(result)
+    assert "present" in text and "SMOKE_VAR=[REDACTED]" in text and P3_VALUE not in text
+    assert "LOOM_COMPUTER_TOKEN" not in tool(port, "shell", {"command": "env"})["stdout"]
+    # and not on disk
+    on_disk = docker("exec", name, "sh", "-c",
+                     f"grep -rl {P3_VALUE} /home/agent /tmp 2>/dev/null | wc -l").stdout.strip()
+    assert on_disk == "0"
+
+    for path, content in (("login.html", P3_LOGIN_PAGE),):
+        tool(port, "files", {"action": "write", "path": f"site/{path}", "content": content})
+    tool(port, "shell", {"command": "setsid -f python3 -m http.server 8099 --bind 127.0.0.1 "
+                         "--directory /home/agent/workspace/site >/dev/null 2>&1 </dev/null"})
+    time.sleep(1)
+    wait_for_browser(port)
+
+    # login: typed on its own site, refused on another
+    tool(port, "browser", {"action": "navigate", "url": "http://localhost:8099/login.html"})
+    tool(port, "browser", {"action": "fill", "selector": "#pw", "secret": "site"})
+    typed = tool(port, "browser", {"action": "text", "selector": "#out"})["text"]
+    assert typed == f"len={len(P3_PASSWORD)} value=[REDACTED]"
+    tool(port, "browser", {"action": "navigate", "url": "http://127.0.0.1:8099/login.html"})
+    refused = mcp(port, "browser", {"action": "fill", "selector": "#pw", "secret": "site"})
+    assert refused["isError"] is True and "nothing was typed" in refused["content"][0]["text"]
+    assert P3_PASSWORD not in json.dumps(refused)
+    assert tool(port, "browser", {"action": "text", "selector": "#out"})["text"] == "empty"
+
+    # a passkey is refused whole, naming the secret only; the set that stands is kept
+    status, body = http_json(port, "PUT", "/secrets", {"V2": "x-value-1", "pk": P3_PASSKEY})
+    assert status == 400 and "pk" in body["error"]
+    for secret in (P3_KEY, P3_CRED):
+        assert secret not in json.dumps(body)
+    assert tool(port, "browser", {"action": "text", "selector": "#out"})["text"] == "empty"
+    status, body = http_json(port, "PUT", "/secrets", {"SMOKE_VAR": P3_VALUE})
+    assert status == 200 and body == {"ok": True, "variables": 1, "logins": 0}
+    # the registration endpoints stay gone
+    for method, path in (("PUT", "/passkeys/registration"), ("GET", "/passkeys/registration"),
+                         ("POST", "/passkeys/registration/answer")):
+        assert http_json(port, method, path, {})[0] == 404
+
+    # the whole container logged none of it
+    logs = docker("logs", name)
+    for secret in (P3_VALUE, P3_PASSWORD, P3_KEY):
+        assert secret not in logs.stdout + logs.stderr
