@@ -66,9 +66,11 @@ def totp_code(secret: str, now: float, digits: int = 6, step: int = 30) -> str:
     return str(number % 10 ** digits).zfill(digits)
 
 
-def _site(entry: str) -> tuple[str | None, str, int | None]:
+def _site(entry: str, name: str | None = None) -> tuple[str | None, str, int | None]:
     """(scheme or None, host, port or None) of a login's site entry: a bare
-    host (`example.com`), a host with port, or an origin/URL."""
+    host (`example.com`), a host with port, or an origin/URL. `name` is the secret the entry
+    belongs to, named in the error."""
+    where = f"secret {_shown(name)}: " if name is not None else ""
     text = entry.strip().lower()
     if "://" not in text:
         text = "//" + text
@@ -76,10 +78,10 @@ def _site(entry: str) -> tuple[str | None, str, int | None]:
         parts = urlsplit(text)
         host, port = parts.hostname, parts.port
     except ValueError:
-        raise SecretsError("a login site is not a host or origin") from None
+        raise SecretsError(f"{where}a login site is not a host or origin") from None
     scheme = parts.scheme or None
     if scheme not in (None, "http", "https") or not host or not _HOST.match(host):
-        raise SecretsError("a login site is not a host or origin")
+        raise SecretsError(f"{where}a login site is not a host or origin")
     return scheme, host, port
 
 
@@ -170,7 +172,7 @@ class SecretStore:
                         f"secret {_shown(name)}: passkeys are not supported; "
                         "remove it from the set")
                 else:
-                    raise SecretsError(f"secret {_shown(name)}: unknown kind")
+                    raise SecretsError(f"secret {_shown(name)}: unknown kind in the \"kind\" field")
             else:
                 raise SecretsError(f"secret {_shown(name)}: must be a string or a typed record")
         self.variables, self.logins = variables, logins
@@ -186,7 +188,7 @@ class SecretStore:
                 or not all(isinstance(s, str) and s.strip() for s in sites)):
             raise SecretsError(f"secret {_shown(name)}: sites must be a non-empty list of hosts")
         for site in sites:
-            _site(site)
+            _site(site, name)
         username = _string(record, "username", name)
         password = _string(record, "password", name)
         totp = _string(record, "totp", name, required=False)
@@ -267,6 +269,15 @@ class SecretStore:
         """A streaming masker that asks for the needles as they stand at each
         chunk, so a value granted mid-stream is masked from then on."""
         return ByteMask(self._live_needles)
+
+    def redact_bytes(self, data: bytes) -> bytes:
+        """`data` with every live needle (UTF-8 and JSON-escaped spellings)
+        replaced by the mask."""
+        mask = REDACTED.encode()
+        for needle in self._live_needles():
+            if needle in data:
+                data = data.replace(needle, mask)
+        return data
 
     def redact(self, text: str) -> str:
         self._prune()

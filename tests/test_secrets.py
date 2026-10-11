@@ -303,6 +303,39 @@ def test_redaction_covers_files_read_and_errors(client, workspace):
     assert VAR_VALUE not in bad
 
 
+def test_base64_read_masks_raw_bytes_at_every_offset(client, workspace):
+    import os
+    put_secrets(client, {"MY_TOKEN": VAR_VALUE})
+    value = VAR_VALUE.encode()
+    filler = os.urandom(300).replace(value, b"")
+    for offset in (0, 1, 2, 5, 150):
+        (workspace / "b.bin").write_bytes(filler[:offset] + value + filler[offset:])
+        got = answer(call(client, "files", {"action": "read", "path": "b.bin",
+                                            "encoding": "base64"}))
+        raw = base64.b64decode(got["content"])
+        assert value not in raw and VAR_VALUE not in got["content"]
+        assert raw == filler[:offset] + b"[REDACTED]" + filler[offset:]
+        assert got["bytes"] == len(raw)
+
+
+def test_base64_read_of_clean_binary_round_trips(client, workspace):
+    import os
+    put_secrets(client, {"MY_TOKEN": VAR_VALUE})
+    data = os.urandom(512)
+    (workspace / "c.bin").write_bytes(data)
+    got = answer(call(client, "files", {"action": "read", "path": "c.bin",
+                                        "encoding": "base64"}))
+    assert base64.b64decode(got["content"]) == data and got["bytes"] == 512
+
+
+def test_malformed_set_errors_name_the_secret(client):
+    bad_site = {"kind": "login", "sites": ["not a host!"], "username": "u", "password": "p"}
+    r = put_secrets(client, {"SITEY": bad_site})
+    assert r.status_code == 400 and "SITEY" in r.text and "login site" in r.text
+    r = put_secrets(client, {"KINDY": {"kind": "wat"}})
+    assert r.status_code == 400 and "KINDY" in r.text and "kind" in r.text
+
+
 def test_redaction_masks_json_escaped_forms(client):
     tricky = 'quo"te\\back'
     put_secrets(client, {"T": tricky})

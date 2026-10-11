@@ -80,7 +80,8 @@ Design:
   (`X-Loom-Redacted: best-effort`, no `Content-Length`, `max_bytes` counts
   output bytes). That is byte-level matching of the value as UTF-8 (and its
   JSON-escaped spelling): a value a file holds re-encoded (base64, compressed,
-  split across lines, UTF-16) is not recognized.
+  split across lines, UTF-16) is not recognized. (`files read` with `encoding: base64` masks the raw
+  bytes before encoding, so that path is covered.)
   *Accepted limit:* the `X-Loom-Truncated` header comes from a probe made
   before streaming starts, so it reflects the mask set at probe time and can
   be stale if grants change mid-download. The body is always masked with the
@@ -90,9 +91,13 @@ Design:
   print or transform them; redaction only catches the plain forms. The
   browser's CDP port is reachable from inside the container, so a job can
   drive the browser (read a filled password field, or a page's text before
-  masking). Screenshots (`capture image`/`png`) are pixels
-  and are not redacted. A login's `sites` entry covers its host *and every
+  masking). Screenshots (`capture image`/`png` answers)
+  are pixels and are not redacted: the agent must see the screen to work, and
+  the person sees the same screen in the viewer. A login's `sites` entry covers its host *and every
   subdomain of it*, so a page anywhere under that host receives the secret.
+  Scope logins to real hosts: a bare public suffix (`com`, `co.uk`, ...)
+  covers every host beneath it, `attacker.com` included. No public-suffix
+  list is built in; a hand-rolled one would be incomplete and misleading.
 - **Logins.** `browser fill {selector, secret, field?}`; the page origin is
   read and checked against `sites` and the typing happens in the same page
   evaluation guarded by that origin, so a navigation cannot slip between. A

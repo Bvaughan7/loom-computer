@@ -229,7 +229,14 @@ class Tools:
         if encoding not in ("utf-8", "base64"):
             raise ToolError('encoding must be "utf-8" or "base64"')
         if action == "read":
-            return self._text(await _blocking(self.workspace.read, path, encoding))
+            got = await _blocking(self.workspace.read, path, encoding)
+            if encoding == "base64":
+                # mask the raw bytes: base64 of a value is not a spelling the
+                # text redactor knows
+                data = self.secrets.redact_bytes(base64.b64decode(got["content"]))
+                got = {**got, "bytes": len(data),
+                       "content": base64.b64encode(data).decode("ascii")}
+            return self._text(got)
         if action == "write":
             append = args.get("append", False)
             if not isinstance(append, bool):
