@@ -4,6 +4,13 @@ name: release
 # ghcr.io/bvaughan7/loom-computer:<version>, and creates the GitHub release
 # Loom's desk discovers. workflow_dispatch is a dry run: it builds, smoke-checks
 # the guide and pushes nothing.
+#
+# Two jobs. `build` is read-only and runs on both events: it builds the image
+# once, smoke-checks that exact image and hands it over as an artifact.
+# `publish` runs on tag push only and holds the write permissions: it loads
+# that artifact, verifies the image ID is the one the smoke check ran, and
+# pushes it. Nothing is rebuilt, so the published digest is the smoke-checked
+# image.
 on:
   push:
     tags: ["v[0-9]+.[0-9]+.[0-9]+"]
@@ -21,11 +28,13 @@ env:
   IMAGE: ghcr.io/bvaughan7/loom-computer
 
 jobs:
-  release:
+  build:
     runs-on: ubuntu-latest
     permissions:
-      contents: write   # create the GitHub release
-      packages: write   # push to GHCR
+      contents: read   # no write scope on either event, including the dry run
+    outputs:
+      tag: ${{ steps.v.outputs.tag }}
+      image_id: ${{ steps.id.outputs.image_id }}
     steps:
       - uses: actions/checkout@v4
 
@@ -38,9 +47,19 @@ jobs:
         run: |
           set -euo pipefail
           file_version="$(tr -d '[:space:]' < VERSION)"
+          # same plain-semver rule as scripts/release.sh (no leading zeros)
+          semver='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+          if ! printf '%s' "$file_version" | grep -Eq "$semver"; then
+            echo "::error::VERSION file '$file_version' is not plain semver X.Y.Z"
+            exit 1
+          fi
           echo "file=$file_version" >> "$GITHUB_OUTPUT"
           if [ "$EVENT" = push ]; then
             tag_version="${REF_NAME#v}"
+            if ! printf '%s' "$tag_version" | grep -Eq "$semver"; then
+              echo "::error::tag $REF_NAME is not plain semver vX.Y.Z"
+              exit 1
+            fi
             if [ "$tag_version" != "$file_version" ]; then
               echo "::error::tag $REF_NAME does not match VERSION file ($file_version)"
               exit 1
@@ -56,7 +75,7 @@ jobs:
 
       - uses: docker/setup-buildx-action@v3
 
-      - name: Build (loaded locally for the smoke check)
+      - name: Build once (loaded locally; this is the image that gets published)
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -86,30 +105,72 @@ jobs:
             exit 1
           fi
 
-      - name: Log in to GHCR
+      - name: Export the smoke-checked image
+        id: id
+        env:
+          REF: ${{ env.IMAGE }}:${{ steps.v.outputs.tag }}
+        run: |
+          set -euo pipefail
+          echo "image_id=$(docker image inspect --format '{{.Id}}' "$REF")" >> "$GITHUB_OUTPUT"
+          docker save "$REF" -o image.tar
+
+      - uses: actions/upload-artifact@v4
         if: github.event_name == 'push'
+        with:
+          name: image
+          path: image.tar
+          retention-days: 1
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    if: github.event_name == 'push'   # the dry run never reaches the write scopes
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # create the GitHub release
+      packages: write   # push to GHCR
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: image
+
+      - name: Load the smoke-checked image and verify it is the one that was checked
+        env:
+          REF: ${{ env.IMAGE }}:${{ needs.build.outputs.tag }}
+          WANT_ID: ${{ needs.build.outputs.image_id }}
+        run: |
+          set -euo pipefail
+          docker load -i image.tar
+          got="$(docker image inspect --format '{{.Id}}' "$REF")"
+          if [ "$got" != "$WANT_ID" ]; then
+            echo "::error::loaded image $got is not the smoke-checked image $WANT_ID"
+            exit 1
+          fi
+
+      - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Push
-        if: github.event_name == 'push'
+      - name: Push the smoke-checked image
         id: push
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          push: true
-          tags: ${{ env.IMAGE }}:${{ steps.v.outputs.tag }}
-          build-args: VERSION=${{ steps.v.outputs.file }}
+        env:
+          REF: ${{ env.IMAGE }}:${{ needs.build.outputs.tag }}
+        run: |
+          set -euo pipefail
+          docker push "$REF" | tee push.log
+          digest="$(sed -n 's/.*digest: \(sha256:[0-9a-f]\{64\}\).*/\1/p' push.log | tail -n1)"
+          test -n "$digest"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
 
       - name: Create GitHub release
-        if: github.event_name == 'push'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
           TAG: ${{ github.ref_name }}
-          REF: ${{ env.IMAGE }}:${{ steps.v.outputs.tag }}
+          REF: ${{ env.IMAGE }}:${{ needs.build.outputs.tag }}
           DIGEST: ${{ steps.push.outputs.digest }}
         run: |
           set -euo pipefail

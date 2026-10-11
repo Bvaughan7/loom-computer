@@ -5,8 +5,8 @@ Linux desktop that a teammate drives through one MCP server. It is local
 infrastructure, not a special agent type. Loom grants the machine's `/mcp`
 endpoint to a teammate like any other server, and the person sees and drives
 the same desktop through the viewer the machine serves. The image releases on
-its own schedule; this skeleton is release line **0.10.3** (the `VERSION` file), Loom's
-`COMPUTER_VERSION` floor.
+its own schedule; this skeleton's release line is whatever the `VERSION` file
+says (0.10.3 as of this writing), Loom's `COMPUTER_VERSION` floor.
 
 ## Contract summary
 
@@ -14,7 +14,7 @@ Source of truth: Loom's `docs/computer.md`. Phases 0-2 implement:
 
 | Route | Behavior |
 | --- | --- |
-| `GET /health` | Open liveness probe, `200 {"status":"ok","version":"0.10.3"}`. |
+| `GET /health` | Open liveness probe, `200 {"status":"ok","version":"<VERSION>"}` (e.g. `"0.10.3"`). |
 | `POST /mcp` | Needs `Authorization: Bearer $LOOM_COMPUTER_TOKEN`, else JSON 401 for every method (as does every route other than `GET /health` and `GET /`). JSON-RPC body. `tools/call` `state` with `action: "guide"` returns the release skill (`name`, `version`, bare-hex `sha256` of `skill`, and the `skill` text); the other tools are below. `initialize` and `tools/list` are answered. A tool that refuses or fails answers a result with `isError: true` and a text reason; an unknown tool is JSON-RPC `-32602`, an unknown method `-32601`. |
 | `X-Computer-Holder` | Names the teammate for leases and queued runs. Phase 0 only logs it at debug level. |
 | `GET /` | The viewer: a single page (no external assets, CSP-pinned inline script) that reads the token from the URL fragment, opens `/ws`, and draws frames on a canvas. |
@@ -132,13 +132,18 @@ reads it for the build arg and refuses a tag that does not match it.
    `v<version>` and pushes the tag (it asks first; `--yes` skips that). If
    `VERSION` already holds the version, no commit is made and the tag lands
    on HEAD.
-2. The tag push triggers `.github/workflows/release.yml`: it checks tag ==
-   `VERSION`, builds the image, smoke-checks that the built image's guide
-   serves that version, pushes
-   `ghcr.io/bvaughan7/loom-computer:<version>` with `GITHUB_TOKEN`
-   (`contents: write` for the release, `packages: write`), and creates the
-   GitHub release `v<version>` whose notes carry the image reference and the
-   pushed digest (and a `@sha256:` pinned form).
+2. The tag push triggers `.github/workflows/release.yml`, two jobs. `build`
+   (`contents: read` only) checks tag == `VERSION` and that both are plain
+   semver (no leading zeros, same rule as the script), builds the image
+   **once**, smoke-checks that image's guide serves that version, and hands
+   it to `publish` as an artifact (`docker save`) along with its image ID.
+   `publish` (tag push only; `contents: write`, `packages: write`) loads the
+   artifact, fails unless the image ID equals the smoke-checked one, pushes
+   `ghcr.io/bvaughan7/loom-computer:<version>` with `GITHUB_TOKEN`, and
+   creates the GitHub release `v<version>` whose notes carry the image
+   reference and the pushed digest (and a `@sha256:` pinned form). Nothing
+   is rebuilt between the smoke check and the push, so the published digest
+   is the image that was checked.
 3. The desk discovers it: `releases.rs` lists the repo's releases and parses
    `tag_name`; the desk derives the image as
    `ghcr.io/bvaughan7/loom-computer:<tag without v>`, and learns the running
@@ -148,8 +153,9 @@ Dry runs push nothing: `./scripts/release.sh --dry-run [<version>]` builds the
 image locally as `ghcr.io/bvaughan7/loom-computer:<version>` (from a copy of
 the tree, so it works before `VERSION` is bumped and changes no git state),
 starts it and checks the guide serves `<version>`. In CI, `workflow_dispatch`
-with an `image_tag` does the same build and smoke check and stops before
-login, push and release.
+with an `image_tag` runs only the read-only `build` job (same build and
+smoke check); the `publish` job, the only one with write permissions, is
+skipped.
 
 ### `latest` is not tagged
 
@@ -164,14 +170,15 @@ The repository and package are private. Pulling needs `docker login ghcr.io`
 with a classic PAT that has `read:packages` (`write:packages` to push by
 hand; CI uses `GITHUB_TOKEN`, no PAT). While private, the desk host must be
 logged in and the desk should use pinned image references
-(`ghcr.io/bvaughan7/loom-computer:0.10.3`, as in its pin setting): the
+(e.g. `ghcr.io/bvaughan7/loom-computer:0.10.3`, as in its pin setting): the
 unauthenticated GitHub releases listing cannot see a private repo's
 releases, so "Newest" discovery works only once the repo is public or the
 desk is given a token, and the floor/pins work regardless.
 
-### First real release (v0.10.3), what Bryan does
+### First real release, what Bryan does
 
-`VERSION` already says 0.10.3 and no tag exists, so nothing needs bumping.
+As of this writing `VERSION` says 0.10.3 and no tag exists, so nothing needs
+bumping (use the number in `VERSION` wherever 0.10.3 appears below).
 
 1. Merge this branch (`phase4/release-pipeline`) to the main branch.
 2. In the repo's Settings > Actions > General, give workflows read and write
@@ -179,13 +186,13 @@ desk is given a token, and the floor/pins work regardless.
    `permissions:` block, which is sufficient).
 3. Optionally rehearse: Actions > release > Run workflow (`image_tag`
    `dryrun`), and/or `./scripts/release.sh --dry-run`.
-4. `./scripts/release.sh 0.10.3`. Watch the run (`gh run list --workflow
+4. `./scripts/release.sh <VERSION>` (0.10.3 at time of writing). Watch the run (`gh run list --workflow
    release.yml`).
 5. After the first push, GHCR creates the package private and linked to the
    repo; check Packages > loom-computer > Package settings (visibility,
    and that the repo has Actions write access to it).
 6. On the desk host: `docker login ghcr.io` (PAT with `read:packages`), then
-   `docker pull ghcr.io/bvaughan7/loom-computer:0.10.3`.
+   `docker pull ghcr.io/bvaughan7/loom-computer:<VERSION>`.
 
 ## Held for redesign
 

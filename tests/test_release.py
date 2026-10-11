@@ -14,7 +14,7 @@ from loom_computer import VERSION
 ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = ROOT / "scripts" / "release.sh"
 IMAGE = "ghcr.io/bvaughan7/loom-computer"
-SEMVER = r"^\d+\.\d+\.\d+$"
+SEMVER = r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$"
 
 
 def run(*cmd, **kw):
@@ -47,19 +47,82 @@ def test_dockerfile_reads_version_for_label_and_build_arg():
     assert 'test "$VERSION" = "$(cat VERSION)"' in df
 
 
+def load_workflow():
+    text = (ROOT / ".github/workflows/release.yml").read_text()
+    return yaml.safe_load(text), text
+
+
 def test_workflow_shape():
-    wf = yaml.safe_load((ROOT / ".github/workflows/release.yml").read_text())
+    wf, text = load_workflow()
     triggers = wf[True]  # YAML 1.1 parses the bare key `on` as True
     assert triggers["push"]["tags"] == ["v[0-9]+.[0-9]+.[0-9]+"]
     assert "image_tag" in triggers["workflow_dispatch"]["inputs"]
-    job = wf["jobs"]["release"]
-    assert job["permissions"] == {"contents": "write", "packages": "write"}
     assert wf["permissions"] == {"contents": "read"}
-    pushes = [s for s in job["steps"] if s.get("if") == "github.event_name == 'push'"]
-    assert len(pushes) >= 3  # login, push, release: dry-run path does none of them
-    text = (ROOT / ".github/workflows/release.yml").read_text()
+    assert set(wf["jobs"]) == {"build", "publish"}
     assert ":latest" not in text
     assert "VERSION" in text
+
+
+def test_dispatch_path_holds_no_write_permissions():
+    wf, _ = load_workflow()
+    build, publish = wf["jobs"]["build"], wf["jobs"]["publish"]
+    # build runs on both events (no job-level `if`) and is read-only
+    assert "if" not in build
+    assert build["permissions"] == {"contents": "read"}
+    for scope, level in {**wf["permissions"], **build["permissions"]}.items():
+        assert level in ("read", "none"), scope
+    # everything that can write is in publish, which only runs on tag push
+    assert publish["if"] == "github.event_name == 'push'"
+    assert publish["needs"] == "build"
+    assert publish["permissions"] == {"contents": "write", "packages": "write"}
+    build_text = yaml.safe_dump(build)
+    for needle in ("login-action", "secrets.GITHUB_TOKEN", "docker push", "gh release"):
+        assert needle not in build_text
+
+
+def test_published_image_is_the_smoke_checked_image():
+    wf, _ = load_workflow()
+    build, publish = wf["jobs"]["build"], wf["jobs"]["publish"]
+    # exactly one build, in the build job, never pushed from there
+    builds = [s for j in (build, publish) for s in j["steps"]
+              if str(s.get("uses", "")).startswith("docker/build-push-action")]
+    assert len(builds) == 1 and builds[0]["with"]["push"] is False
+    smoke = [i for i, s in enumerate(build["steps"]) if "Smoke check" in s.get("name", "")]
+    export = [i for i, s in enumerate(build["steps"]) if "docker save" in s.get("run", "")]
+    assert smoke and export and smoke[0] < export[0]
+    # publish pushes the loaded artifact, after verifying its image ID
+    run_steps = [s.get("run", "") for s in publish["steps"]]
+    load_i = next(i for i, r in enumerate(run_steps) if "docker load" in r)
+    push_i = next(i for i, r in enumerate(run_steps) if "docker push" in r)
+    assert load_i < push_i
+    assert "needs.build.outputs.image_id" in str(publish["steps"][load_i])
+    assert 'docker image inspect --format \'{{.Id}}\'' in run_steps[load_i]
+    assert "docker build" not in "".join(run_steps)
+
+
+def semver_ok(value):
+    """The resolve step's regex, exactly as written in the workflow."""
+    import re
+    _, text = load_workflow()
+    pattern = re.search(r"semver='([^']+)'", text).group(1)
+    assert pattern == SEMVER
+    return re.match(pattern, value) is not None
+
+
+@pytest.mark.parametrize("good", ["0.0.0", "0.10.3", "1.2.3", "10.20.30"])
+def test_semver_regex_accepts_plain_semver(good):
+    assert semver_ok(good)
+
+
+@pytest.mark.parametrize("bad", ["01.2.3", "1.02.3", "1.2.03", "1.2", "1.2.3-rc1", "v1.2.3", ""])
+def test_semver_regex_rejects_leading_zeros_and_non_semver(bad):
+    assert not semver_ok(bad)
+
+
+def test_workflow_resolve_step_enforces_semver_on_tag():
+    _, text = load_workflow()
+    assert 'grep -Eq "$semver"' in text
+    assert "is not plain semver" in text
 
 
 # --- scripts/release.sh --dry-run ---
