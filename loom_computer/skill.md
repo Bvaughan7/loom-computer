@@ -106,8 +106,7 @@ answer has them replaced by `[REDACTED]`.
 - A *login* is typed with `browser fill` and `secret`, only on its own sites.
   Navigate there first; on any other page the fill is refused.
 - A *passkey* is already in the browser: a site's passkey sign-in is answered
-  without anything typed. Nothing you do can create a passkey; only the
-  person can, by arming a site.
+  without anything typed. Nothing you do can create a passkey.
 
 ## state
 

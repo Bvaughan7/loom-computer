@@ -267,22 +267,6 @@ navigator.credentials.get({publicKey: {challenge: new Uint8Array(32), rpId: 'loc
         e => document.getElementById('out').textContent = 'error ' + e.name);
 </script>""" % P3_CRED
 
-P3_REGISTER_PAGE = """<!doctype html><title>register</title>
-<button id="go" onclick="go()">Register</button><p id="out">idle</p>
-<script>
-function go() {
-  document.getElementById('out').textContent = 'creating';
-  navigator.credentials.create({publicKey: {challenge: new Uint8Array(32),
-    rp: {id: 'localhost', name: 'Smoke Site'},
-    user: {id: new Uint8Array([1, 2, 3]), name: 'alice', displayName: 'Alice'},
-    pubKeyCredParams: [{type: 'public-key', alg: -7}],
-    authenticatorSelection: {residentKey: 'required', userVerification: 'preferred'}}})
-    .then(c => document.getElementById('out').textContent = 'created ' + c.type,
-          e => document.getElementById('out').textContent = 'error ' + e.name);
-}
-</script>"""
-
-
 def http_json(port, method, path, body=None):
     import json
 
@@ -330,8 +314,7 @@ def test_phase3_secrets_in_the_real_container(container):
                      f"grep -rl {P3_VALUE} /home/agent /tmp 2>/dev/null | wc -l").stdout.strip()
     assert on_disk == "0"
 
-    for path, content in (("login.html", P3_LOGIN_PAGE), ("passkey.html", P3_PASSKEY_PAGE),
-                          ("register.html", P3_REGISTER_PAGE)):
+    for path, content in (("login.html", P3_LOGIN_PAGE), ("passkey.html", P3_PASSKEY_PAGE)):
         tool(port, "files", {"action": "write", "path": f"site/{path}", "content": content})
     tool(port, "shell", {"command": "setsid -f python3 -m http.server 8099 --bind 127.0.0.1 "
                          "--directory /home/agent/workspace/site >/dev/null 2>&1 </dev/null"})
@@ -353,44 +336,7 @@ def test_phase3_secrets_in_the_real_container(container):
     tool(port, "browser", {"action": "navigate", "url": "http://localhost:8099/passkey.html"})
     assert page_text(port, until=lambda t: t != "pending").startswith("got public-key")
 
-    # registration: unarmed create() is refused, armed it is parked and asked
-    tool(port, "browser", {"action": "navigate", "url": "http://localhost:8099/register.html"})
-    tool(port, "browser", {"action": "click", "selector": "#go"})
-    assert page_text(port, until=lambda t: t != "creating") == "error NotAllowedError"
-    assert http_json(port, "GET", "/passkeys/registration")[1] == {"status": "idle"}
-
-    assert http_json(port, "PUT", "/passkeys/registration", {"rpId": "localhost"})[0] == 200
-    tool(port, "browser", {"action": "navigate", "url": "http://localhost:8099/register.html"})
-    tool(port, "browser", {"action": "click", "selector": "#go"})
-    deadline = time.time() + 20
-    while True:
-        got = http_json(port, "GET", "/passkeys/registration")[1]
-        if got["status"] == "asked" or time.time() > deadline:
-            break
-        time.sleep(0.3)
-    assert got["status"] == "asked", got
-    assert got["ask"]["rpId"] == "localhost" and got["ask"]["rpName"] == "Smoke Site"
-    assert got["ask"]["userName"] == "alice" and got["ask"]["origin"] == "http://localhost:8099"
-    assert page_text(port) == "creating"  # parked: the site is still waiting
-    assert http_json(port, "POST", "/passkeys/registration/answer",
-                     {"id": got["ask"]["id"], "approved": True})[0] == 200
-    assert page_text(port, until=lambda t: t != "creating") == "created public-key"
-    deadline = time.time() + 20
-    while True:
-        got = http_json(port, "GET", "/passkeys/registration")[1]
-        if got["status"] == "registered" or time.time() > deadline:
-            break
-        time.sleep(0.3)
-    assert got["status"] == "registered" and got["passkey"]["kind"] == "passkey"
-    assert got["passkey"]["rpId"] == "localhost" and got["passkey"]["privateKey"]
-    # the minted key is masked from tool output from now on
-    leak = tool(port, "shell", {"command": "echo " + got["passkey"]["privateKey"]})
-    assert got["passkey"]["privateKey"] not in json.dumps(leak)
-    assert http_json(port, "DELETE", "/passkeys/registration")[0] == 200
-    assert http_json(port, "POST", "/passkeys/registration/answer",
-                     {"id": "x", "approved": True})[0] == 409
-
     # the whole container logged none of it
     logs = docker("logs", name)
-    for secret in (P3_VALUE, P3_PASSWORD, P3_KEY, got["passkey"]["privateKey"]):
+    for secret in (P3_VALUE, P3_PASSWORD, P3_KEY):
         assert secret not in logs.stdout + logs.stderr

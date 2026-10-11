@@ -23,7 +23,7 @@ from . import VERSION
 from .browser import Browser
 from .desktop import Desktop, FrameHub, InputSession
 from .errors import ToolError
-from .passkeys import Passkeys, valid_rp_id
+from .passkeys import Passkeys
 from .secrets import SecretMask, SecretStore, SecretsError
 from .tools import DEFINITIONS, Tools
 
@@ -271,33 +271,6 @@ def create_app(token: str, desktop: Desktop | None = None,
         log.info("secrets replaced: %d variables, %d logins, %d passkeys",
                  counts["variables"], counts["logins"], counts["passkeys"])
         return {"ok": True, **counts}
-
-    @app.put("/passkeys/registration")
-    async def arm_registration(request: Request):
-        body = await _json_body(request)
-        rp_id = body.get("rpId") if isinstance(body, dict) else None
-        if not valid_rp_id(rp_id):
-            return _bad("rpId must be a host name")
-        return await passkeys.arm(rp_id.lower())
-
-    @app.get("/passkeys/registration")
-    async def registration_status():
-        return passkeys.status()
-
-    @app.delete("/passkeys/registration")
-    async def disarm_registration():
-        await passkeys.disarm()
-        return {"status": "idle"}
-
-    @app.post("/passkeys/registration/answer")
-    async def answer_registration(request: Request):
-        body = await _json_body(request)
-        if (not isinstance(body, dict) or not isinstance(body.get("id"), str)
-                or not isinstance(body.get("approved"), bool)):
-            return _bad('body must be {"id": string, "approved": boolean}')
-        if not await passkeys.answer(body["id"], body["approved"]):
-            return _bad("no such request is waiting", 409)
-        return passkeys.status()
 
     @app.get("/files/download")
     async def download(path: str = "", max_bytes: str | None = None):

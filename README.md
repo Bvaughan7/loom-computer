@@ -27,8 +27,9 @@ loopback). The server refuses to start if `LOOM_COMPUTER_TOKEN` is unset.
 Nothing runs as root: the image uses the `agent` user (UID 1000) with
 `/home/agent/workspace` as its working directory.
 
-Phase 3 adds the secrets routes below. Not implemented (not in Phase 3's
-scope): `DELETE /logins/{name}` and `state login_load`.
+Phase 3 adds the secrets route below. Not implemented (not in Phase 3's
+scope): `DELETE /logins/{name}` and `state login_load`. The passkey
+registration ceremony is held for redesign (see *Held for redesign*).
 
 ### `state login_load` (left unimplemented, deliberately)
 
@@ -46,10 +47,6 @@ contract's own signal that a release predates it).
 | Route | Behavior |
 | --- | --- |
 | `PUT /secrets` | Bearer. The whole granted set, a JSON object of name to secret, replacing the last. A string is a variable; `{"kind":"login","sites":[...],"username","password","totp"?}`; `{"kind":"passkey","rpId","credentialId","privateKey","userHandle"?,"userName"?,"userDisplayName"?}` (`credentialId`, `privateKey`, `userHandle` base64 or base64url; `totp` base32 or an `otpauth://` URI). Answers `200 {"ok":true,"variables":n,"logins":n,"passkeys":n}`; a malformed set is `400 {"error"}` (naming the secret and the field, never a value) and leaves the previous set. There is **no GET**. |
-| `PUT /passkeys/registration` | Bearer. `{"rpId"}` arms the computer for ten minutes for that site and readies the browser (a tab exists, authenticators attached). `200 {"status":"armed","rpId","expiresAt"}`. |
-| `GET /passkeys/registration` | `{"status":"idle"}`, `{"status":"armed",...}`, `{"status":"asked","ask":{id,rpId,origin,rpName?,userName?,userDisplayName?,askedAt}}`, `{"status":"approved"}`, then `{"status":"registered","passkey":{kind,rpId,credentialId,privateKey,userHandle?,userName?,userDisplayName?}}`. |
-| `POST /passkeys/registration/answer` | `{"id","approved"}`. 409 when that request is not waiting (including after expiry). Denied: the site gets `NotAllowedError` and the arming ends. |
-| `DELETE /passkeys/registration` | Ends the arming (the desk does this after storing the passkey). |
 
 Design:
 
@@ -73,11 +70,11 @@ Design:
   password / totp secret, passkeys' key material) replaced by `[REDACTED]`.
   Structured answers are masked in their Python objects *before* JSON
   serialization, so no escape form (`\uXXXX`, `\b`, `\f`, ...) can carry a
-  value; log records are masked the same way. Three lifetimes matter:
+  value; log records are masked the same way. Two lifetimes matter:
   replacing the set does not unmask a value a running job still holds (it
   stays masked until that job has finished and answered), a generated TOTP
   code is masked from the moment it is made until its 30 s step ends plus a
-  10 s margin, and a minted passkey's key joins the masks.
+  10 s margin.
   `GET /files/download` masks the same values in the bytes it streams
   (`X-Loom-Redacted: best-effort`, no `Content-Length`, `max_bytes` counts
   output bytes). That is byte-level matching of the value as UTF-8 (and its
@@ -92,8 +89,8 @@ Design:
   print or transform them; redaction only catches the plain forms. The
   browser's CDP port is reachable from inside the container, so a job can
   drive the browser (read a filled password field, or a page's text before
-  masking) and the passkey guard is a defense against pages, not against code
-  running in the container. Screenshots (`capture image`/`png`) are pixels
+  masking), and it can read the authenticator's key material over the same
+  port. Screenshots (`capture image`/`png`) are pixels
   and are not redacted. A login's `sites` entry covers its host *and every
   subdomain of it*, so a page anywhere under that host receives the secret.
 - **Logins.** `browser fill {selector, secret, field?}`; the page origin is
@@ -106,27 +103,45 @@ Design:
   tab (a virtual authenticator exists only as long as the socket that made
   it), with a CTAP2 internal authenticator with automatic presence/verification
   simulation, loaded with the granted passkeys; tabs are attached again
-  before any browser tool call and every second. Two Chromium behaviors
-  shape this (found against the real browser): its window has no OS focus in
-  this desktop, and a WebAuthn ceremony waits for a focused page, so the
-  showing tab is brought to front (no tab is switched); and the browser
-  drops the WebAuthn domain's state around every navigation's load, which
-  orphans a ceremony started before it. The page script therefore holds each
-  `get()` (and an approved `create()`) until the document has loaded and the
-  authenticator has survived it, then lets it through; a `get()` the computer
-  never answers goes ahead after 8 s.
-- **Registration guard.** A script injected in every document wraps
-  `CredentialsContainer.prototype.create` and reports through a CDP binding;
-  the computer decides. Only while armed, for that rpId, from an origin within
-  it, one at a time, is a request parked (`asked`); everything else gets a
-  `NotAllowedError` immediately. On approval the page's own `create()` runs
-  and the authenticator's `credentialAdded` event yields the record. Anything
-  that appears in an authenticator without an approval for this arming (or for
-  another site, or after expiry) is removed on its event and on every look.
-  The approval is bound to the parked ceremony (its tab, rpId and the
-  `user.id` the page asked to register): only that credential is taken, and
-  any other, even while the approval is in flight, is removed immediately.
-  Minted key material joins the redaction masks.
+  before any browser tool call and every second. Each look makes the
+  authenticator hold exactly the granted set: a credential that is not
+  granted is removed on its event and on every look, and replacing the set
+  removes a dropped passkey. The showing tab is brought to front when its
+  page has no focus, because a WebAuthn ceremony waits for a focused page.
+  Nothing mints a passkey: only sign-in (`navigator.credentials.get()`) with
+  a granted passkey is answered.
+
+## Held for redesign: passkey registration
+
+The passkey registration ceremony (`PUT` / `GET` / `DELETE
+/passkeys/registration`, `POST /passkeys/registration/answer`, and the
+page-side guard that parked `navigator.credentials.create()`) was removed
+from this release line and is held for redesign. Three known issues stand
+in the way:
+
+1. **Tab-secret harvesting.** The page guard released parked requests through
+   `window.__loomRelease`, authenticated by a per-tab secret the page script
+   shares with the computer. A page that harvests that secret can forge guard
+   reports, so the computer can be told a request was parked, or a guard was
+   in place, when it was not.
+2. **Clean-slate race.** The authenticator was snapshotted and emptied at
+   approval, and the first credential added afterwards was taken as the
+   mint. A credential added between the snapshot and the approval's release
+   races with it.
+3. **Nonce eviction at 4097.** Single-use ask nonces were tracked in a
+   bounded set that evicts its oldest entry past 4096, so the 4097th nonce
+   lets an evicted one be replayed and the single-use guarantee breaks.
+
+Until the ceremony returns, a passkey reaches the computer only as a granted
+`PUT /secrets` record. The sign-in hold that rode on the same page script
+(a `get()` held until the document loaded and the authenticator survived a
+navigation) went with it; the watcher re-attaches the authenticator every
+second instead. The fake-DevTools tests cover loading and cleanup, but the
+real-Chromium navigation race that hold papered over is not re-verified here
+(`tests/test_image.py` needs docker).
+
+`state login_load` is still unimplemented: the contract names it with no
+defined shape, and this release does not invent one.
 
 ## The tools (Phase 2)
 

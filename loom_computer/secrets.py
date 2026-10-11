@@ -164,7 +164,6 @@ class SecretStore:
         self._needles: list[tuple[str, str]] = []
         self._encoded: list[bytes] | None = None  # `_needles` as bytes, built on use
         self._listeners: list = []
-        self.extra: set[str] = set()  # minted-but-not-yet-delivered values to redact
         # Values a live job still holds in its environment after the set was
         # replaced: masked until that job ends. lease id -> values.
         self._held: dict[int, frozenset[str]] = {}
@@ -248,7 +247,7 @@ class SecretStore:
     # -- redaction ------------------------------------------------------------
 
     def _values(self) -> set[str]:
-        values = set(self.variables.values()) | self.extra | set(self._timed)
+        values = set(self.variables.values()) | set(self._timed)
         for held in self._held.values():
             values |= held
         for login in self.logins.values():
@@ -275,11 +274,6 @@ class SecretStore:
                                        lambda m: "\\u" + m.group(1).upper(), form))
         self._needles = [(n, REDACTED) for n in sorted(needles, key=len, reverse=True)]
         self._encoded = None
-
-    def remember(self, value: str) -> None:
-        """Add a value minted at runtime (a new passkey's key) to the masks."""
-        self.extra.add(value)
-        self._rebuild()
 
     def hold(self, values) -> int:
         """Keep `values` masked until `release(lease)`, whatever replaces the
