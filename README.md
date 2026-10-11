@@ -32,20 +32,30 @@ Not yet implemented: `PUT /secrets`, `/passkeys/registration`,
 
 ## The desktop (Phase 1)
 
-`supervisord` (pip-pinned, runs as `agent`) keeps four processes up:
+`loom_computer.init` is PID 1. It runs `supervisord` (pip-pinned, as `agent`)
+for the three desktop processes and forks the API next to it:
 
 | Process | Choice | Why |
 | --- | --- | --- |
 | X server | `Xvfb :99`, 1280x800x24, no TCP | Headless, in-memory framebuffer, nothing to configure. |
 | Window manager | Openbox, no panel/menu, windows maximized | Full desktop semantics (focus, move, resize, EWMH that Chromium expects) for a few MB. Xfce/LXDE would add a panel, session manager, and compositor-era dependencies (hundreds of MB) that nothing here uses. |
 | Browser | Debian's `chromium`, `--no-sandbox` | `--no-sandbox` because the container runs `--cap-drop=ALL` + the default seccomp profile, which forbids the user namespaces Chromium's sandbox needs; the container is the boundary. |
-| API | `python -m loom_computer` (uvicorn) | Serves `/health`, `/mcp`, `/`, `/ws`. |
+| API | `loom_computer.init` forks `loom_computer.app.main` (uvicorn) | Serves `/health`, `/mcp`, `/`, `/ws`. Not under supervisord, see below. |
 
 Supervisor: supervisord over s6/runit because it is one pinned wheel (no extra
 apt packages, no overlay of init scripts), restarts crashed children, reaps
-zombies as PID 1, and its config is a single readable file. Desktop processes
-are started with `env -u LOOM_COMPUTER_TOKEN` so the browser and anything it
-spawns never inherit the bearer.
+and its config is a single readable file. Desktop processes are started
+without the token (and again with `env -u LOOM_COMPUTER_TOKEN`) so the
+browser and anything it spawns never inherit the bearer.
+
+**Token isolation.** Everything shares the `agent` UID: `--cap-drop=ALL` and
+`no-new-privileges` leave no way to run the API as a second user, and nothing
+runs as root. Instead the two token holders (`init` and the API) mark
+themselves non-dumpable (`prctl(PR_SET_DUMPABLE, 0)`), which makes their
+`/proc/<pid>/environ`, `mem` and ptrace need privileges `agent` lacks. The
+flag does not survive `exec`, so `init` holds the token without ever
+exec-ing and the API is a plain `fork` of it. Anything the API later spawns
+must be started with the token removed from its environment.
 
 **Stream protocol, not VNC/noVNC.** Loom's contract says the Remote door
 carries frames to a phone as they are and passes only *text* back. An RFB

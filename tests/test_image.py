@@ -66,6 +66,28 @@ def test_desktop_processes_are_up_without_the_token(container):
     assert leaked == "0"
 
 
+def test_token_is_unreadable_to_other_processes(container):
+    """From a plain `agent` process (as a workspace job or Chromium would be),
+    no /proc/<pid>/environ holds the token, including the API's and PID 1's."""
+    name, _ = container
+    # `env -u` so this probe's own environment does not carry the token.
+    probe = ("env -u LOOM_COMPUTER_TOKEN sh -c '"
+             "readable=0; found=0; "
+             "for f in /proc/[0-9]*/environ; do "
+             "if tr \"\\0\" \"\\n\" < $f 2>/dev/null | grep -q " + TOKEN + "; then found=$((found+1)); fi; "
+             "if cat $f >/dev/null 2>&1; then readable=$((readable+1)); fi; done; "
+             "echo $found $readable'")
+    found, readable = docker("exec", name, "sh", "-c", probe).stdout.split()
+    assert found == "0"
+    assert int(readable) > 0  # the probe really could read other processes
+    # The two token holders specifically: PID 1 (init) and the API it forks.
+    api = docker("exec", name, "pgrep", "-f", "loom_computer.init").stdout.split()
+    assert "1" in api and len(api) >= 2
+    for pid in api:
+        r = docker("exec", name, "cat", f"/proc/{pid}/environ", check=False)
+        assert r.returncode != 0 and TOKEN not in r.stdout
+
+
 def test_screenshot_equivalent_over_ws(container):
     import websockets
     from PIL import Image
