@@ -29,17 +29,6 @@ class SecretsError(ValueError):
     """A set that cannot be taken. The message never holds a secret value."""
 
 
-def b64_bytes(value: str) -> bytes:
-    """Bytes of a base64 or base64url string, padding optional."""
-    text = value.strip().replace("-", "+").replace("_", "/")
-    text += "=" * (-len(text) % 4)
-    return base64.b64decode(text, validate=True)
-
-
-def b64_std(value: str) -> str:
-    return base64.b64encode(b64_bytes(value)).decode("ascii")
-
-
 @dataclass(frozen=True)
 class Login:
     name: str
@@ -52,21 +41,6 @@ class Login:
         if not self.totp:
             raise ToolError("this login has no totp secret")
         return totp_code(self.totp, time.time() if now is None else now)
-
-
-@dataclass(frozen=True)
-class Passkey:
-    name: str
-    rp_id: str
-    credential_id: str  # standard base64, as the WebAuthn domain wants it
-    private_key: str
-    user_handle: str | None = None
-    user_name: str | None = None
-    user_display_name: str | None = None
-
-    @property
-    def key(self) -> bytes:
-        return b64_bytes(self.credential_id)
 
 
 def totp_lifetime(now: float, step: int = 30, margin: int = 10) -> float:
@@ -160,7 +134,6 @@ class SecretStore:
     def __init__(self):
         self.variables: dict[str, str] = {}
         self.logins: dict[str, Login] = {}
-        self.passkeys: dict[str, Passkey] = {}
         self._needles: list[tuple[str, str]] = []
         self._encoded: list[bytes] | None = None  # `_needles` as bytes, built on use
         self._listeners: list = []
@@ -180,7 +153,6 @@ class SecretStore:
             raise SecretsError("the body must be a JSON object of name to secret")
         variables: dict[str, str] = {}
         logins: dict[str, Login] = {}
-        passkeys: dict[str, Passkey] = {}
         for name, value in payload.items():
             if not isinstance(name, str) or not name:
                 raise SecretsError("a secret needs a non-empty name")
@@ -194,17 +166,18 @@ class SecretStore:
                 if kind == "login":
                     logins[name] = self._login(name, value)
                 elif kind == "passkey":
-                    passkeys[name] = self._passkey(name, value)
+                    raise SecretsError(
+                        f"secret {_shown(name)}: passkeys are not supported; "
+                        "remove it from the set")
                 else:
                     raise SecretsError(f"secret {_shown(name)}: unknown kind")
             else:
                 raise SecretsError(f"secret {_shown(name)}: must be a string or a typed record")
-        self.variables, self.logins, self.passkeys = variables, logins, passkeys
+        self.variables, self.logins = variables, logins
         self._rebuild()
         for listener in list(self._listeners):
             listener()
-        return {"variables": len(variables), "logins": len(logins),
-                "passkeys": len(passkeys)}
+        return {"variables": len(variables), "logins": len(logins)}
 
     @staticmethod
     def _login(name: str, record: dict) -> Login:
@@ -224,23 +197,6 @@ class SecretStore:
                 raise SecretsError(f"secret {_shown(name)}: totp is not valid base32") from None
         return Login(name, tuple(s.strip() for s in sites), username, password, totp)
 
-    @staticmethod
-    def _passkey(name: str, record: dict) -> Passkey:
-        rp_id = _string(record, "rpId", name).lower()
-        fields = {}
-        for key in ("credentialId", "privateKey", "userHandle"):
-            value = _string(record, key, name, required=key != "userHandle")
-            if value is not None:
-                try:
-                    fields[key] = b64_std(value)
-                except (binascii.Error, ValueError):
-                    raise SecretsError(
-                        f"secret {_shown(name)}: {key} must be base64") from None
-        extras = [_string(record, key, name, required=False)
-                  for key in ("userName", "userDisplayName")]
-        return Passkey(name, rp_id, fields["credentialId"], fields["privateKey"],
-                       fields.get("userHandle"), *extras)
-
     def on_change(self, listener) -> None:
         self._listeners.append(listener)
 
@@ -254,9 +210,6 @@ class SecretStore:
             values.update((login.username, login.password))
             if login.totp:
                 values.add(login.totp)
-        for key in self.passkeys.values():
-            values.update(v for v in (key.private_key, key.credential_id,
-                                      key.user_handle) if v)
         return {v for v in values if v}
 
     def _rebuild(self) -> None:

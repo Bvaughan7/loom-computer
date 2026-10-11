@@ -23,7 +23,6 @@ from . import VERSION
 from .browser import Browser
 from .desktop import Desktop, FrameHub, InputSession
 from .errors import ToolError
-from .passkeys import Passkeys
 from .secrets import SecretMask, SecretStore, SecretsError
 from .tools import DEFINITIONS, Tools
 
@@ -181,8 +180,6 @@ def create_app(token: str, desktop: Desktop | None = None,
     desktop = desktop or Desktop()
     browser = browser or Browser()
     store = SecretStore()
-    passkeys = Passkeys(store, browser.endpoint)
-    browser.before_page = passkeys.attach_all  # a new tab has its authenticator first
     package_log = logging.getLogger("loom_computer")
     for old in [f for f in package_log.filters if isinstance(f, SecretMask)]:
         package_log.removeFilter(old)  # one app, one set (tests make many)
@@ -192,16 +189,13 @@ def create_app(token: str, desktop: Desktop | None = None,
 
     @contextlib.asynccontextmanager
     async def lifespan(_app):
-        passkeys.start()
         yield
-        await passkeys.stop()
         tools.shutdown()  # no job outlives the API
 
     app = FastAPI(title="Loom Computer", version=VERSION, lifespan=lifespan,
                   docs_url=None, redoc_url=None, openapi_url=None)
 
     app.state.secrets = store
-    app.state.passkeys = passkeys
     hub = FrameHub(desktop)
     viewer_html, viewer_csp = _viewer_page()
 
@@ -267,9 +261,8 @@ def create_app(token: str, desktop: Desktop | None = None,
             counts = store.replace(await _json_body(request))
         except SecretsError as exc:
             return _bad(str(exc))
-        passkeys.start()
-        log.info("secrets replaced: %d variables, %d logins, %d passkeys",
-                 counts["variables"], counts["logins"], counts["passkeys"])
+        log.info("secrets replaced: %d variables, %d logins",
+                 counts["variables"], counts["logins"])
         return {"ok": True, **counts}
 
     @app.get("/files/download")

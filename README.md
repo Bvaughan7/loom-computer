@@ -28,8 +28,9 @@ Nothing runs as root: the image uses the `agent` user (UID 1000) with
 `/home/agent/workspace` as its working directory.
 
 Phase 3 adds the secrets route below. Not implemented (not in Phase 3's
-scope): `DELETE /logins/{name}` and `state login_load`. The passkey
-registration ceremony is held for redesign (see *Held for redesign*).
+scope): `DELETE /logins/{name}` and `state login_load`. Passkeys (the
+registration ceremony and the loading/guard machinery) are held for redesign
+(see *Held for redesign*).
 
 ### `state login_load` (left unimplemented, deliberately)
 
@@ -46,7 +47,7 @@ contract's own signal that a release predates it).
 
 | Route | Behavior |
 | --- | --- |
-| `PUT /secrets` | Bearer. The whole granted set, a JSON object of name to secret, replacing the last. A string is a variable; `{"kind":"login","sites":[...],"username","password","totp"?}`; `{"kind":"passkey","rpId","credentialId","privateKey","userHandle"?,"userName"?,"userDisplayName"?}` (`credentialId`, `privateKey`, `userHandle` base64 or base64url; `totp` base32 or an `otpauth://` URI). Answers `200 {"ok":true,"variables":n,"logins":n,"passkeys":n}`; a malformed set is `400 {"error"}` (naming the secret and the field, never a value) and leaves the previous set. There is **no GET**. |
+| `PUT /secrets` | Bearer. The whole granted set, a JSON object of name to secret, replacing the last. A string is a variable; `{"kind":"login","sites":[...],"username","password","totp"?}` (`totp` base32 or an `otpauth://` URI). A `{"kind":"passkey",...}` record is refused: the **whole set** is `400`, naming the secret (never a value), because passkeys are held for redesign. Answers `200 {"ok":true,"variables":n,"logins":n}`; a malformed set is `400 {"error"}` (naming the secret and the field, never a value) and leaves the previous set. There is **no GET**. |
 
 Design:
 
@@ -56,7 +57,7 @@ Design:
   what happens to a value afterwards. A job holds its variables in its own
   environment and can write them to a file; the workspace and the browser
   profile persist (a login typed into a page may be kept by the browser, and
-  a passkey lives in the browser's authenticator while the tab does). Routes
+  and so on). Routes
   parse bodies by hand so a framework validation error can never echo a
   value.
 - **Variables** are merged into the environment of every `shell` / `files
@@ -67,7 +68,7 @@ Design:
   constants, so they never inherit the bearer.
 - **Redaction.** Every tool answer (text blocks and structured content,
   errors included) has each granted value (variables, logins' username /
-  password / totp secret, passkeys' key material) replaced by `[REDACTED]`.
+  password / totp secret) replaced by `[REDACTED]`.
   Structured answers are masked in their Python objects *before* JSON
   serialization, so no escape form (`\uXXXX`, `\b`, `\f`, ...) can carry a
   value; log records are masked the same way. Two lifetimes matter:
@@ -89,8 +90,7 @@ Design:
   print or transform them; redaction only catches the plain forms. The
   browser's CDP port is reachable from inside the container, so a job can
   drive the browser (read a filled password field, or a page's text before
-  masking), and it can read the authenticator's key material over the same
-  port. Screenshots (`capture image`/`png`) are pixels
+  masking). Screenshots (`capture image`/`png`) are pixels
   and are not redacted. A login's `sites` entry covers its host *and every
   subdomain of it*, so a page anywhere under that host receives the secret.
 - **Logins.** `browser fill {selector, secret, field?}`; the page origin is
@@ -99,52 +99,51 @@ Design:
   site entry covers its host and hosts within it; a bare host means https
   (plain http only for `localhost`/`127.0.0.1`); an entry with a scheme or
   port must match those too.
-- **Passkeys.** A background watcher keeps one long-lived DevTools socket per
-  tab (a virtual authenticator exists only as long as the socket that made
-  it), with a CTAP2 internal authenticator with automatic presence/verification
-  simulation, loaded with the granted passkeys; tabs are attached again
-  before any browser tool call and every second. Each look makes the
-  authenticator hold exactly the granted set: a credential that is not
-  granted is removed on its event and on every look, and replacing the set
-  removes a dropped passkey. The showing tab is brought to front when its
-  page has no focus, because a WebAuthn ceremony waits for a focused page.
-  Nothing mints a passkey: only sign-in (`navigator.credentials.get()`) with
-  a granted passkey is answered. Two server-side holds keep it so, with no
-  script in the page: the DevTools Fetch domain pauses every document
-  response, attaches the tab's authenticator and loads the granted set
-  before releasing it (the sign-in readiness hold, so a `get()` at load
-  finds it), and releases it with `Permissions-Policy:
-  publickey-credentials-create=()` so `create()` is refused by the browser.
-  A tab on `about:blank` holds no authenticator until a real document loads.
+## Held for redesign
 
-## Held for redesign: passkey registration
+All passkey code is held, and none ships in this release: no registration
+ceremony, no virtual-authenticator loading, no guard. `PUT /secrets` refuses a
+`kind: "passkey"` record (whole set `400`, naming the secret), the
+`/passkeys/registration*` routes answer `404`, and the served guide says
+passkeys are not supported. Two designs are held, each with known issues a
+redesign must start from.
 
-The passkey registration ceremony (`PUT` / `GET` / `DELETE
-/passkeys/registration`, `POST /passkeys/registration/answer`, and the
-page-side guard that parked `navigator.credentials.create()`) was removed
-from this release line and is held for redesign. Three known issues stand
-in the way:
+### (a) Passkey registration ceremony
 
-1. **Tab-secret harvesting.** The page guard released parked requests through
-   `window.__loomRelease`, authenticated by a per-tab secret the page script
-   shares with the computer. A page that harvests that secret can forge guard
-   reports, so the computer can be told a request was parked, or a guard was
-   in place, when it was not.
+Was `PUT` / `GET` / `DELETE /passkeys/registration`, `POST
+/passkeys/registration/answer`, and a page-side guard parking
+`navigator.credentials.create()`.
+
+1. **Tab-secret harvesting.** The guard released parked requests through
+   `window.__loomRelease`, authenticated by a per-tab secret shared with the
+   page script. A page that harvests the secret can forge guard reports.
 2. **Clean-slate race.** The authenticator was snapshotted and emptied at
-   approval, and the first credential added afterwards was taken as the
-   mint. A credential added between the snapshot and the approval's release
-   races with it.
-3. **Nonce eviction at 4097.** Single-use ask nonces were tracked in a
-   bounded set that evicts its oldest entry past 4096, so the 4097th nonce
-   lets an evicted one be replayed and the single-use guarantee breaks.
+   approval and the first credential added afterwards was taken as the mint;
+   a credential added between snapshot and release races with it.
+3. **Nonce eviction at 4097.** Single-use ask nonces lived in a set bounded
+   at 4096; the 4097th evicts the oldest, which can then be replayed.
 
-Until the ceremony returns, a passkey reaches the computer only as a granted
-`PUT /secrets` record, and `create()` is refused outright (see *Passkeys*
-above); `tests/test_image.py` covers create-then-immediate-get and a
-page-driven navigation's `get()` at load against real Chromium.
+### (b) Passkey loading and guard
 
-`state login_load` is still unimplemented: the contract names it with no
-defined shape, and this release does not invent one.
+Was a CDP watcher loading granted passkeys into a virtual
+authenticator per tab, plus a guard: `Permissions-Policy:
+publickey-credentials-create=()` injected on document responses via the Fetch
+domain, a Fetch-pause readiness hold, and removal of ungranted credentials.
+All of it was passkey-specific, so nothing generic of it remains.
+
+1. **Popup interception timing.** A popup can load before the polling-based
+   interception is enabled for it, so its first document is unguarded.
+2. **Cross-process subframes.** Out-of-process subframes sit outside the
+   interception scope and get neither the policy header nor the hold.
+3. **Fail-open readiness hold.** After its retries the hold releases the
+   document without a ready authenticator, so a `get()` at load can miss.
+4. **`about:blank` cleanup race.** Cleanup of ungranted credentials on a tab
+   at `about:blank` races with the document that replaces it.
+
+### `state login_load`
+
+Still unimplemented: the contract names it with no defined arguments, store
+or answer, and this release does not invent one (see above).
 
 ## The tools (Phase 2)
 
@@ -254,7 +253,7 @@ python -m pytest
 0. **Skeleton**: health, MCP stub, guide, viewer and socket stubs, image. (this)
 1. **Desktop + viewer streaming**: a real X desktop, the viewer page and `/ws`. (this)
 2. **MCP tools**: `state`, `shell`, `files`, `browser`, and friends over `/mcp`.
-3. **Secrets**: `PUT /secrets`, logins, passkeys, redaction. (this)
+3. **Secrets**: `PUT /secrets`, variables, logins, redaction. (this; passkeys held)
 4. **Release pipeline**: tagged releases published to GHCR.
 5. **Three-agent integration test**: three teammates sharing one computer
    with leases and queued runs.

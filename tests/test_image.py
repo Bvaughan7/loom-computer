@@ -249,6 +249,9 @@ P3_KEY = ("MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgRqWJh2dhYVVfPNQKF3jnI
           "fTQhJFl8xUdt4OihRANCAAQ0s8ww5WFY0AgGCAdAkSDRbOrTchhs35kPKnw4Yu9pEkWgx1NxdJvhF6qP"
           "oxMik67ig/aiCAiCSrQhog4v9wH0")
 P3_CRED = "Y3JlZGVudGlhbC1pZC0wMTIzNDU2Nzg5"
+# a passkey is refused (never loaded): only used to check the refusal
+P3_PASSKEY = {"kind": "passkey", "rpId": "localhost", "credentialId": P3_CRED,
+              "privateKey": P3_KEY, "userHandle": "AQID"}
 
 P3_LOGIN_PAGE = """<!doctype html><title>login</title>
 <input id="pw" type="password">
@@ -256,37 +259,6 @@ P3_LOGIN_PAGE = """<!doctype html><title>login</title>
 <script>document.getElementById('pw').addEventListener('input', e =>
   document.getElementById('out').textContent = 'len=' + e.target.value.length +
   ' value=' + e.target.value)</script>"""
-
-P3_PASSKEY_PAGE = """<!doctype html><title>passkey</title><p id="out">pending</p>
-<script>
-const b = s => Uint8Array.from(atob(s), c => c.charCodeAt(0));
-navigator.credentials.get({publicKey: {challenge: new Uint8Array(32), rpId: 'localhost',
-  allowCredentials: [{type: 'public-key', id: b('%s')}], userVerification: 'preferred',
-  timeout: 20000}})
-  .then(c => document.getElementById('out').textContent = 'got ' + c.type + ' ' + c.id.length,
-        e => document.getElementById('out').textContent = 'error ' + e.name);
-</script>""" % P3_CRED
-
-P3_CREATE_PAGE = """<!doctype html><title>create</title><p id="out">creating</p>
-<script>
-const out = t => document.getElementById('out').textContent = t;
-navigator.credentials.create({publicKey: {challenge: new Uint8Array(32),
-  rp: {id: 'localhost', name: 'Smoke Site'},
-  user: {id: new Uint8Array([1, 2, 3]), name: 'alice', displayName: 'Alice'},
-  pubKeyCredParams: [{type: 'public-key', alg: -7}],
-  authenticatorSelection: {residentKey: 'required', userVerification: 'preferred'}}})
-  .then(c => navigator.credentials.get({publicKey: {challenge: new Uint8Array(32),
-          rpId: 'localhost', allowCredentials: [{type: 'public-key', id: c.rawId}],
-          userVerification: 'preferred', timeout: 20000}})
-        .then(a => out('created and got ' + a.type), e => out('created, get ' + e.name)),
-        e => out('create ' + e.name));
-</script>"""
-
-# a page that navigates itself to the passkey page: its get() runs at load, with
-# no look from the tools in between
-P3_HOP_PAGE = """<!doctype html><title>hop</title><p id="out">pending</p>
-<script>setTimeout(() => location.href = '/passkey.html?hop', 300)</script>"""
-
 
 def http_json(port, method, path, body=None):
     import json
@@ -318,9 +290,7 @@ def test_phase3_secrets_in_the_real_container(container):
     status, body = http_json(port, "PUT", "/secrets", {
         "SMOKE_VAR": P3_VALUE,
         "site": {"kind": "login", "sites": ["localhost"], "username": "alice",
-                 "password": P3_PASSWORD},
-        "pk": {"kind": "passkey", "rpId": "localhost", "credentialId": P3_CRED,
-               "privateKey": P3_KEY, "userHandle": "AQID"}})
+                 "password": P3_PASSWORD}})
     assert status == 200 and body["variables"] == 1 and body["logins"] == 1
     assert http_json(port, "GET", "/secrets")[0] in (404, 405)
 
@@ -335,8 +305,7 @@ def test_phase3_secrets_in_the_real_container(container):
                      f"grep -rl {P3_VALUE} /home/agent /tmp 2>/dev/null | wc -l").stdout.strip()
     assert on_disk == "0"
 
-    for path, content in (("login.html", P3_LOGIN_PAGE), ("passkey.html", P3_PASSKEY_PAGE),
-                          ("create.html", P3_CREATE_PAGE), ("hop.html", P3_HOP_PAGE)):
+    for path, content in (("login.html", P3_LOGIN_PAGE),):
         tool(port, "files", {"action": "write", "path": f"site/{path}", "content": content})
     tool(port, "shell", {"command": "setsid -f python3 -m http.server 8099 --bind 127.0.0.1 "
                          "--directory /home/agent/workspace/site >/dev/null 2>&1 </dev/null"})
@@ -354,18 +323,18 @@ def test_phase3_secrets_in_the_real_container(container):
     assert P3_PASSWORD not in json.dumps(refused)
     assert tool(port, "browser", {"action": "text", "selector": "#out"})["text"] == "empty"
 
-    # passkey: the site's get() is answered by the virtual authenticator
-    tool(port, "browser", {"action": "navigate", "url": "http://localhost:8099/passkey.html"})
-    assert page_text(port, until=lambda t: t != "pending").startswith("got public-key")
-
-    # a navigation the page makes itself: get() at load finds the authenticator
-    tool(port, "browser", {"action": "navigate", "url": "http://localhost:8099/hop.html"})
-    time.sleep(1.5)
-    assert page_text(port, until=lambda t: t != "pending").startswith("got public-key")
-
-    # nothing mints a passkey: create() is refused, and no get() can follow it
-    tool(port, "browser", {"action": "navigate", "url": "http://localhost:8099/create.html"})
-    assert page_text(port, until=lambda t: t != "creating") == "create NotAllowedError"
+    # a passkey is refused whole, naming the secret only; the set that stands is kept
+    status, body = http_json(port, "PUT", "/secrets", {"V2": "x-value-1", "pk": P3_PASSKEY})
+    assert status == 400 and "pk" in body["error"]
+    for secret in (P3_KEY, P3_CRED):
+        assert secret not in json.dumps(body)
+    assert tool(port, "browser", {"action": "text", "selector": "#out"})["text"] == "empty"
+    status, body = http_json(port, "PUT", "/secrets", {"SMOKE_VAR": P3_VALUE})
+    assert status == 200 and body == {"ok": True, "variables": 1, "logins": 0}
+    # the registration endpoints stay gone
+    for method, path in (("PUT", "/passkeys/registration"), ("GET", "/passkeys/registration"),
+                         ("POST", "/passkeys/registration/answer")):
+        assert http_json(port, method, path, {})[0] == 404
 
     # the whole container logged none of it
     logs = docker("logs", name)

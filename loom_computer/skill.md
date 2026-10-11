@@ -105,8 +105,8 @@ answer has them replaced by `[REDACTED]`.
   job, under its name (`$NAME`).
 - A *login* is typed with `browser fill` and `secret`, only on its own sites.
   Navigate there first; on any other page the fill is refused.
-- A *passkey* is already in the browser: a site's passkey sign-in is answered
-  without anything typed. Nothing you do can create a passkey.
+- Passkeys are not supported: none is loaded, answered or created, so use a
+  site's other sign-in method.
 
 ## state
 

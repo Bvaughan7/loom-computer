@@ -132,7 +132,6 @@ class Browser:
     def __init__(self, endpoint: str | None = None):
         self.endpoint = endpoint or os.environ.get("LOOM_CDP_ENDPOINT", DEFAULT_ENDPOINT)
         self._lock = asyncio.Lock()
-        self.before_page = None  # async callable: runs before a tab is chosen
 
     async def _pages(self) -> list[dict]:
         try:
@@ -181,8 +180,6 @@ class Browser:
         from websockets.exceptions import WebSocketException
 
         async with self._lock:
-            if self.before_page is not None:
-                await self.before_page()
             for attempt in (1, 2):
                 url = await self._target()
                 started = False

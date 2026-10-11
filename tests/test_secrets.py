@@ -1,4 +1,4 @@
-"""Phase 3: secrets, logins, passkeys, redaction.
+"""Phase 3: secrets, logins, redaction.
 
 Browser behavior runs against a fake DevTools endpoint that answers the few
 calls the computer makes and records the rest; the real Chromium is covered
@@ -48,9 +48,7 @@ class FakeCDP:
         self.origins = list(origins)  # one page origin per tab
         self.fills: list[str] = []  # expressions that typed something
         self.calls: list[tuple[int, str, dict]] = []
-        self.credentials: dict[int, dict[str, dict]] = {}
         self.sockets: dict[int, object] = {}
-        self.policy: dict[int, str] = {}  # the Permissions-Policy of each tab's document
         self.page_text = ""  # what `browser text` finds on every page
         self._ready = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -87,7 +85,6 @@ class FakeCDP:
     async def _handle(self, socket):
         index = int(socket.request.path.strip("/"))
         self.sockets[index] = socket
-        self.credentials.setdefault(index, {})
         async for raw in socket:
             msg = json.loads(raw)
             method, params = msg["method"], msg.get("params", {})
@@ -96,21 +93,6 @@ class FakeCDP:
             await socket.send(json.dumps({"id": msg["id"], "result": result}))
 
     def _answer(self, index, method, params):
-        creds = self.credentials[index]
-        if method == "WebAuthn.addVirtualAuthenticator":
-            return {"authenticatorId": f"auth{index}"}
-        if method == "WebAuthn.addCredential":
-            creds[params["credential"]["credentialId"]] = params["credential"]
-            return {}
-        if method == "WebAuthn.getCredentials":
-            return {"credentials": list(creds.values())}
-        if method == "WebAuthn.removeCredential":
-            creds.pop(params["credentialId"], None)
-            return {}
-        if method == "Fetch.continueResponse":
-            names = {h["name"].lower(): h["value"] for h in params.get("responseHeaders", [])}
-            self.policy[index] = names.get("permissions-policy", "")
-            return {}
         if method == "Runtime.evaluate":
             expression = params.get("expression", "")
             origin = self.origins[index]
@@ -137,27 +119,6 @@ class FakeCDP:
         return {}
 
     # -- driving the page side --------------------------------------------------
-
-    def create(self, index) -> bool:
-        """What the browser does with navigator.credentials.create() on a tab:
-        refused when its document came with create forbidden, otherwise a
-        credential is minted into the authenticator."""
-        if "publickey-credentials-create=()" in self.policy.get(index, ""):
-            return False
-        self.credentials[index]["minted"] = {"credentialId": "minted", "rpId": "example.com",
-                                             "isResidentCredential": True, "privateKey": "x"}
-        return True
-
-    def get(self, index) -> list[str]:
-        """The credentials an immediate get() could assert with."""
-        return list(self.credentials[index])
-
-    def hold(self, index, headers=(), url="https://example.com/"):
-        """A document response the browser holds for the DevTools client."""
-        self.event(index, "Fetch.requestPaused", {
-            "requestId": f"req{len(self.calls)}", "resourceType": "Document",
-            "responseStatusCode": 200, "request": {"url": url},
-            "responseHeaders": [{"name": n, "value": v} for n, v in headers]})
 
     def event(self, index, method, params):
         future = asyncio.run_coroutine_threadsafe(
@@ -226,9 +187,9 @@ def test_there_is_no_get_for_secrets(client):
 
 
 def test_put_answers_counts_not_values(client):
-    r = put_secrets(client, {"V": VAR_VALUE, "L": LOGIN, "P": PASSKEY})
+    r = put_secrets(client, {"V": VAR_VALUE, "L": LOGIN})
     assert r.status_code == 200
-    assert r.json() == {"ok": True, "variables": 1, "logins": 1, "passkeys": 1}
+    assert r.json() == {"ok": True, "variables": 1, "logins": 1}
     for value in (VAR_VALUE, PASSWORD, USERNAME, KEY):
         assert value not in r.text
 
@@ -239,8 +200,6 @@ def test_put_answers_counts_not_values(client):
     {"A": {"kind": "login", "sites": ["a.com"], "username": "u"}},
     {"A": {"kind": "login", "sites": ["a.com"], "username": "u", "password": "p",
            "totp": "!!notbase32!!"}},
-    {"A": {"kind": "passkey", "rpId": "a.com"}},
-    {"A": {"kind": "passkey", "rpId": "a.com", "credentialId": "***", "privateKey": "x"}},
 ])
 def test_invalid_sets_are_400_and_change_nothing(client, body):
     put_secrets(client, {"KEEP": VAR_VALUE})
@@ -248,6 +207,18 @@ def test_invalid_sets_are_400_and_change_nothing(client, body):
     assert r.status_code == 400
     out = answer(call(client, "shell", {"command": "echo -n $KEEP | wc -c"}))
     assert out["stdout"].strip() == str(len(VAR_VALUE))  # the old set stands
+
+
+def test_a_passkey_refuses_the_whole_set_naming_the_secret_only(client):
+    put_secrets(client, {"KEEP": VAR_VALUE})
+    r = put_secrets(client, {"V": "other-value-1", "my_key": PASSKEY})
+    assert r.status_code == 400
+    assert "my_key" in r.json()["error"]
+    for value in (KEY, CRED_ID, HANDLE, "other-value-1"):
+        assert value not in r.text
+    out = answer(call(client, "shell", {"command": "echo -n $KEEP; echo -n $V"}))
+    assert out["stdout"] == "[REDACTED]"  # the old set stands, nothing half-applied
+    assert put_secrets(client, {"V": VAR_VALUE}).status_code == 200  # a clean set still works
 
 
 def test_invalid_json_and_validation_never_echo_the_input(client):
@@ -428,7 +399,7 @@ def test_nothing_is_written_to_disk(client, workspace, tmp_path, monkeypatch):
             opened.append(str(file))
         return real_open(file, mode, *a, **k)
     monkeypatch.setattr("builtins.open", spy)
-    put_secrets(client, {"V": VAR_VALUE, "L": LOGIN, "P": PASSKEY})
+    put_secrets(client, {"V": VAR_VALUE, "L": LOGIN})
     assert opened == []
 
 
@@ -436,9 +407,9 @@ def test_nothing_is_written_to_disk(client, workspace, tmp_path, monkeypatch):
 
 def test_no_secret_value_appears_in_logs_or_tool_output(client, workspace, caplog, capfd):
     caplog.set_level(logging.DEBUG)
-    body = {"V": VAR_VALUE, "L": {**LOGIN, "totp": "JBSWY3DPEHPK3PXP"}, "P": PASSKEY}
+    body = {"V": VAR_VALUE, "L": {**LOGIN, "totp": "JBSWY3DPEHPK3PXP"}}
     seen = [put_secrets(client, body).text]
-    secrets = [VAR_VALUE, PASSWORD, USERNAME, KEY, CRED_ID, HANDLE, "JBSWY3DPEHPK3PXP"]
+    secrets = [VAR_VALUE, PASSWORD, USERNAME, "JBSWY3DPEHPK3PXP"]
     (workspace / "leak.txt").write_text("\n".join(secrets))
     for name, args in (
             ("shell", {"command": "env; echo $V"}),
@@ -539,111 +510,6 @@ def test_totp_matches_rfc6238_vectors():
     key = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ"  # "12345678901234567890"
     assert totp_code(key, 59, digits=8) == "94287082"
     assert totp_code(key, 1111111109, digits=8) == "07081804"
-
-
-# -- passkeys: authenticator -------------------------------------------------------
-
-def test_passkey_is_loaded_into_the_virtual_authenticator_of_every_tab(make):
-    fake, client = make(["https://example.com", "https://other.test"])
-    with client:
-        put_secrets(client, {"P": PASSKEY})
-        assert wait_for(lambda: all(len(fake.credentials.get(i, {})) == 1 for i in (0, 1)))
-        for index in (0, 1):
-            (cred,) = fake.credentials[index].values()
-            assert cred["rpId"] == "example.com" and cred["privateKey"] == KEY
-            assert cred["credentialId"] == CRED_ID and cred["userHandle"] == HANDLE
-            assert cred["isResidentCredential"] is True
-        methods = {m for i, m, _ in fake.calls}
-        assert {"WebAuthn.enable", "WebAuthn.addVirtualAuthenticator"} <= methods
-        options = next(p for _, m, p in fake.calls if m == "WebAuthn.addVirtualAuthenticator")
-        assert options["options"]["automaticPresenceSimulation"] is True
-
-
-def test_a_tab_opened_later_gets_the_authenticator_too(make):
-    fake, client = make(["https://example.com"])
-    with client:
-        put_secrets(client, {"P": PASSKEY})
-        assert wait_for(lambda: len(fake.credentials.get(0, {})) == 1)
-        fake.origins.append("https://second.test")
-        assert wait_for(lambda: len(fake.credentials.get(1, {})) == 1, 8)
-
-
-def test_replacing_the_set_removes_a_dropped_passkey(make):
-    fake, client = make(["https://example.com"])
-    with client:
-        put_secrets(client, {"P": PASSKEY})
-        assert wait_for(lambda: len(fake.credentials.get(0, {})) == 1)
-        put_secrets(client, {"V": VAR_VALUE})
-        assert wait_for(lambda: fake.credentials[0] == {})
-
-
-def _released(fake, index):
-    return [p for i, m, p in fake.calls if i == index and m == "Fetch.continueResponse"]
-
-
-def test_every_document_is_released_with_create_forbidden(make):
-    fake, client = make(["https://example.com"])
-    with client:
-        assert wait_for(lambda: any(m == "Fetch.enable" for _, m, _ in fake.calls))
-        enable = next(p for _, m, p in fake.calls if m == "Fetch.enable")
-        assert enable["patterns"] == [{"resourceType": "Document", "requestStage": "Response"}]
-        fake.hold(0, [("Content-Type", "text/html"),
-                      ("Permissions-Policy", "publickey-credentials-create=*")])
-        assert wait_for(lambda: _released(fake, 0))
-        (sent,) = _released(fake, 0)
-        assert sent["responseCode"] == 200
-        headers = sent["responseHeaders"]
-        assert headers[0] == {"name": "Content-Type", "value": "text/html"}
-        # last, so it wins over the site's own value for the feature
-        assert headers[-1] == {"name": "Permissions-Policy",
-                               "value": "publickey-credentials-create=()"}
-
-
-def test_create_then_immediate_get_asserts_nothing_ungranted(make):
-    fake, client = make(["https://example.com"])
-    with client:
-        put_secrets(client, {"P": PASSKEY})
-        assert wait_for(lambda: len(fake.credentials.get(0, {})) == 1)
-        fake.hold(0)
-        assert wait_for(lambda: _released(fake, 0))
-        assert fake.create(0) is False  # the browser refuses it outright
-        assert fake.get(0) == [CRED_ID]  # only the granted passkey is there to assert with
-
-
-def test_a_credential_that_slips_through_is_still_removed(make):
-    fake, client = make(["https://example.com"])
-    with client:
-        put_secrets(client, {"P": PASSKEY})
-        assert wait_for(lambda: len(fake.credentials.get(0, {})) == 1)
-        assert fake.create(0) is True  # no document was held: the policy never arrived
-        fake.event(0, "WebAuthn.credentialAdded", {
-            "authenticatorId": "auth0", "credential": fake.credentials[0]["minted"]})
-        assert wait_for(lambda: fake.get(0) == [CRED_ID])
-
-
-def test_a_blank_tab_has_no_authenticator_until_its_document_is_held(make):
-    fake, client = make(["about:blank"])
-    with client:
-        put_secrets(client, {"P": PASSKEY})
-        assert wait_for(lambda: any(m == "Fetch.enable" for _, m, _ in fake.calls))
-        time.sleep(1.5)  # a few watcher passes
-        assert not any(m.startswith("WebAuthn.") for _, m, _ in fake.calls)
-        fake.hold(0)
-        assert wait_for(lambda: _released(fake, 0))
-        names = [m for i, m, _ in fake.calls if i == 0]
-        # attached and loaded before the document was let go: a get() at load finds it
-        assert names.index("WebAuthn.addCredential") < names.index("Fetch.continueResponse")
-        assert len(fake.credentials[0]) == 1
-
-
-def test_a_navigation_to_a_blank_document_drops_the_authenticator(make):
-    fake, client = make(["https://example.com"])
-    with client:
-        assert wait_for(lambda: any(m == "WebAuthn.addVirtualAuthenticator"
-                                    for _, m, _ in fake.calls))
-        fake.event(0, "Page.frameNavigated", {"frame": {"id": "main", "url": "about:blank"}})
-        assert wait_for(lambda: any(m == "WebAuthn.removeVirtualAuthenticator"
-                                    for _, m, _ in fake.calls))
 
 
 # -- store-level ------------------------------------------------------------------
